@@ -8,6 +8,8 @@ Omniscient is local-first. The service has no telemetry or third-party runtime c
 - Do not publish the port through a router, internet-facing proxy, or tunnel.
 - For LAN use, reserve the server's IP, restrict the host firewall to trusted clients, install the generated private CA only on those clients, and verify the CA fingerprint printed at server startup.
 - Keep `data/` private and enable full-disk encryption. The private CA key can issue server certificates and must be protected like an administrator credential.
+- Model/runtime provisioning is the only intended outbound setup step. Once installed, the server sets Transformers/Hugging Face offline flags and loads the pinned Safetensors model from `data/models/`; camera frames are never submitted to a model provider.
+- Do not expose port 8443 to the public internet. For LAN access, trust the private CA on each client and restrict the server host firewall to known devices.
 - Never copy `data/` into a public backup or source-control repository. It is ignored by Git.
 
 ## Data flow

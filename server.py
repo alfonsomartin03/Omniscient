@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Local-only HTTPS and motion-analysis service for Omniscient.
+"""Local-only HTTPS and RT-DETR object tracking service for Omniscient.
 
-Frames are analyzed in memory and discarded. The service has no cloud endpoints,
-telemetry, third-party dependencies, or public account-registration route.
+Frames are analyzed in memory and discarded. Inference is offline and local.
 """
 from __future__ import annotations
 
@@ -24,6 +23,8 @@ import time
 import urllib.parse
 from pathlib import Path
 
+from vision import LOCAL_DETECTOR
+
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 TLS_DIR = DATA / "tls"
@@ -32,7 +33,8 @@ ZONES_FILE = DATA / "restricted_spaces.json"
 STATIC = {"/": "index.html", "/index.html": "index.html", "/styles.css": "styles.css", "/app.js": "app.js"}
 FRAME_W, FRAME_H = 40, 22
 FRAME_SIZE = FRAME_W * FRAME_H
-MAX_BODY = 24_000
+MAX_FRAME_W, MAX_FRAME_H = 960, 540
+MAX_BODY = 2_500_000
 SESSION_TTL = 8 * 60 * 60
 PBKDF2_ROUNDS = 600_000
 
@@ -184,124 +186,74 @@ def point_in_polygon(point: tuple[float, float], polygon: list[dict]) -> bool:
 
 
 def _analyze_frame(session_id: str, encoded: str) -> dict:
+    if not isinstance(encoded, str) or not encoded.startswith("data:image/jpeg;base64,"):
+        raise ValueError("Expected a JPEG camera frame")
     try:
-        pixels = base64.b64decode(encoded, validate=True)
+        frame_data = base64.b64decode(encoded.partition(",")[2], validate=True)
     except (ValueError, TypeError):
         raise ValueError("Invalid frame encoding")
-    if len(pixels) != FRAME_SIZE:
-        raise ValueError("Unexpected frame size")
-    state = ANALYSIS.setdefault(session_id, {"previous": None, "baseline_sum": [0] * FRAME_SIZE, "baseline_frames": 0, "baseline": None, "tracks": {}, "next_id": 1, "anomaly_since": 0.0, "anomaly_alerted": False})
-    now = time.time()
+    if not frame_data or len(frame_data) > 1_800_000:
+        raise ValueError("Camera frame exceeds the permitted size")
+    if LOCAL_DETECTOR is None or not LOCAL_DETECTOR.ready:
+        return {"calibration": 0, "objects": [], "events": [], "zoneEvents": [{"id": z["id"], "events": z["events"]} for z in ZONES], "model": "unavailable"}
+    image, gray = LOCAL_DETECTOR.decode(frame_data, (MAX_FRAME_W, MAX_FRAME_H), (FRAME_W, FRAME_H))
+    state = ANALYSIS.setdefault(session_id, {"baseline_sum": [0] * FRAME_SIZE, "baseline_frames": 0, "baseline": None, "tracks": {}, "next_id": 1})
+    now = time.monotonic()
     if state["baseline"] is None:
         state["baseline_frames"] += 1
-        for i, value in enumerate(pixels):
+        for i, value in enumerate(gray):
             state["baseline_sum"][i] += value
-        if state["baseline_frames"] >= 30:
-            n = state["baseline_frames"]
-            state["baseline"] = bytes(round(value / n) for value in state["baseline_sum"])
-            state["previous"] = pixels
-            return {"calibration": 100, "objects": [], "events": [{"level": "info", "title": "Normal view calibrated", "detail": "Omniscient learned the current scene. Keep the camera fixed for reliable change detection."}], "zoneEvents": [{"id": zone["id"], "events": zone["events"]} for zone in ZONES]}
-        return {"calibration": round(state["baseline_frames"] / 30 * 100), "objects": [], "events": [], "zoneEvents": [{"id": zone["id"], "events": zone["events"]} for zone in ZONES]}
-
-    baseline = state["baseline"]
-    anomaly = bytearray(FRAME_SIZE)
-    changed = 0
-    for i, value in enumerate(pixels):
-        if abs(value - baseline[i]) > 44:
-            anomaly[i] = 1
-            changed += 1
-    events = []
-    if changed > FRAME_SIZE * .045:
-        if not state["anomaly_since"]:
-            state["anomaly_since"] = now
-        if not state["anomaly_alerted"] and now - state["anomaly_since"] > 2.5:
-            level = "high" if changed > FRAME_SIZE * .16 else "medium"
-            events.append({"level": level, "title": "Scene changed from normal view", "detail": f"{round(changed / FRAME_SIZE * 100)}% of the image differs from calibration. Review for a moved or newly present object."})
-            state["anomaly_alerted"] = True
-    else:
-        state["anomaly_since"] = 0.0
-        state["anomaly_alerted"] = False
-
-    previous = state["previous"] or pixels
-    moving = bytearray(FRAME_SIZE)
-    moving_count = 0
-    for i, value in enumerate(pixels):
-        if abs(value - previous[i]) > 25:
-            moving[i] = 1
-            moving_count += 1
-    state["previous"] = pixels
-    boxes = []
-    if moving_count <= FRAME_SIZE * .46:
-        visited = bytearray(FRAME_SIZE)
-        for start in range(FRAME_SIZE):
-            if not moving[start] or visited[start]:
+        if state["baseline_frames"] < 30:
+            return {"calibration": round(state["baseline_frames"] / 30 * 100), "objects": [], "events": [], "zoneEvents": [{"id": z["id"], "events": z["events"]} for z in ZONES], "model": "ready"}
+        n = state["baseline_frames"]
+        state["baseline"] = bytes(round(value / n) for value in state["baseline_sum"])
+    anomaly = bytearray(abs(value - state["baseline"][i]) > 44 for i, value in enumerate(gray))
+    detections = LOCAL_DETECTOR.detect(image)
+    active, matched, output, events = state["tracks"], set(), [], []
+    for detection in detections[:40]:
+        box = detection["box"]
+        candidate, best_iou = None, 0.12
+        for track in active.values():
+            if track["id"] in matched or track["label"] != detection["label"]:
                 continue
-            queue = [start]
-            visited[start] = 1
-            min_x = min_y = FRAME_W
-            max_x = max_y = count = sum_x = sum_y = 0
-            cursor = 0
-            while cursor < len(queue):
-                index = queue[cursor]
-                cursor += 1
-                x, y = index % FRAME_W, index // FRAME_W
-                count += 1
-                min_x, min_y = min(min_x, x), min(min_y, y)
-                max_x, max_y = max(max_x, x), max(max_y, y)
-                sum_x += x
-                sum_y += y
-                for dy in (-1, 0, 1):
-                    for dx in (-1, 0, 1):
-                        nx, ny = x + dx, y + dy
-                        if (dx or dy) and 0 <= nx < FRAME_W and 0 <= ny < FRAME_H:
-                            ni = ny * FRAME_W + nx
-                            if moving[ni] and not visited[ni]:
-                                visited[ni] = 1
-                                queue.append(ni)
-            if count >= 5 and max_x - min_x >= 1 and max_y - min_y >= 1:
-                boxes.append({"x": min_x, "y": min_y, "w": max_x - min_x + 1, "h": max_y - min_y + 1, "cx": sum_x / count, "cy": sum_y / count})
-    boxes.sort(key=lambda box: (box["w"] * box["h"]), reverse=True)
-    active, matched, output = state["tracks"], set(), []
-    for box in boxes[:8]:
-        candidate, distance = None, 14.0
-        for track_id, track in active.items():
-            if track_id in matched:
-                continue
-            d = ((track["cx"] - box["cx"]) ** 2 + (track["cy"] - box["cy"]) ** 2) ** .5
-            if d < distance:
-                candidate, distance = track, d
-        center = (box["cx"] / FRAME_W, box["cy"] / FRAME_H)
+            overlap = LOCAL_DETECTOR.iou(track["box"], box)
+            if overlap > best_iou:
+                candidate, best_iou = track, overlap
+        x1, y1, x2, y2 = box
+        center = ((x1 + x2) / 2, (y1 + y2) / 2)
         zone = next((item for item in ZONES if point_in_polygon(center, item["points"])), None)
-        area_cells = [(x, y) for y in range(box["y"], min(FRAME_H, box["y"] + box["h"])) for x in range(box["x"], min(FRAME_W, box["x"] + box["w"]))]
-        overlap = sum(anomaly[y * FRAME_W + x] for x, y in area_cells) / max(1, len(area_cells))
-        danger = "high" if zone else "medium" if overlap > .3 else "low"
+        gx1, gy1 = max(0, int(x1 * FRAME_W)), max(0, int(y1 * FRAME_H))
+        gx2, gy2 = min(FRAME_W, int(x2 * FRAME_W)), min(FRAME_H, int(y2 * FRAME_H))
+        cells = [(x, y) for y in range(gy1, max(gy1 + 1, gy2)) for x in range(gx1, max(gx1 + 1, gx2))]
+        changed_ratio = sum(anomaly[y * FRAME_W + x] for x, y in cells) / max(1, len(cells))
+        danger = "high" if zone else "medium" if changed_ratio > .16 else "low"
         if candidate is None:
             track_id = state["next_id"]
             state["next_id"] += 1
-            candidate = {"id": track_id, "cx": box["cx"], "cy": box["cy"], "born": now, "last_seen": now, "dwell_alerted": False, "zone_id": None}
+            candidate = {"id": track_id, "label": detection["label"], "box": box, "born": now, "last_seen": now, "zone_id": None, "danger": danger, "confidence": detection["confidence"]}
             active[track_id] = candidate
-            if zone:
-                zone["events"] += 1
-                events.append({"level": "high", "title": f"{zone['name']} entry", "detail": "Object entered a user-defined restricted space. Review the feed for context.", "trackId": track_id})
-            elif danger == "medium":
-                events.append({"level": "medium", "title": "Unusual object movement", "detail": "This track overlaps a region that differs from the calibrated normal view.", "trackId": track_id})
         else:
-            if zone and candidate["zone_id"] != zone["id"]:
-                zone["events"] += 1
-                events.append({"level": "high", "title": f"{zone['name']} entry", "detail": "Object entered a user-defined restricted space. Review the feed for context.", "trackId": candidate["id"]})
-            if not zone and not candidate["dwell_alerted"] and now - candidate["born"] > 8:
-                candidate["dwell_alerted"] = True
-                if danger == "low":
-                    danger = "medium"
-                events.append({"level": "medium", "title": "Extended presence", "detail": "Object remained visible for more than 8 seconds. Review whether the activity is expected.", "trackId": candidate["id"]})
-            candidate.update(cx=box["cx"], cy=box["cy"], last_seen=now)
+            candidate["box"] = [old * .30 + new * .70 for old, new in zip(candidate["box"], box)]
+            candidate.update(last_seen=now, danger=danger, confidence=detection["confidence"])
+        if zone and candidate["zone_id"] != zone["id"]:
+            zone["events"] += 1
+            events.append({"level": "high", "title": f"{zone['name']} entry", "detail": f"{candidate['label']} entered a user-defined restricted space.", "trackId": candidate["id"]})
         candidate["zone_id"] = zone["id"] if zone else None
         matched.add(candidate["id"])
-        output.append({"id": candidate["id"], "x": box["x"] / FRAME_W, "y": box["y"] / FRAME_H, "w": box["w"] / FRAME_W, "h": box["h"] / FRAME_H, "danger": danger})
+        bx1, by1, bx2, by2 = candidate["box"]
+        output.append({"id": candidate["id"], "label": candidate["label"], "confidence": round(candidate["confidence"], 2), "x": bx1, "y": by1, "w": bx2 - bx1, "h": by2 - by1, "danger": danger})
+        # Scene-baseline anomalies create one medium insight per persistent track.
+        if not zone and danger == "medium" and candidate.get("alerted") is not True:
+            candidate["alerted"] = True
+            events.append({"level": "medium", "title": f"Unfamiliar {candidate['label']} detected", "detail": "This object differs from the camera's calibrated normal view. Review the feed for context.", "trackId": candidate["id"]})
     for track_id in list(active):
-        if now - active[track_id]["last_seen"] > 1.2:
+        track = active[track_id]
+        if track_id not in matched and now - track["last_seen"] <= 1.0:
+            bx1, by1, bx2, by2 = track["box"]
+            output.append({"id": track_id, "label": track["label"], "confidence": round(track["confidence"], 2), "x": bx1, "y": by1, "w": bx2 - bx1, "h": by2 - by1, "danger": track["danger"], "stale": True})
+        elif now - track["last_seen"] > 1.0:
             del active[track_id]
-    return {"calibration": 100, "objects": output, "events": events, "zoneEvents": [{"id": zone["id"], "events": zone["events"]} for zone in ZONES]}
+    return {"calibration": 100, "objects": output, "events": events, "zoneEvents": [{"id": z["id"], "events": z["events"]} for z in ZONES], "model": "ready"}
 
 
 def analyze_frame(session_id: str, encoded: str) -> dict:
@@ -442,7 +394,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/session":
             authorized = self.authorized()
             if authorized:
-                self.json(200, {"csrf": authorized[1]["csrf"], "serverAnalysis": True, "frameWidth": FRAME_W, "frameHeight": FRAME_H})
+                self.json(200, {"csrf": authorized[1]["csrf"], "serverAnalysis": True, "modelReady": bool(LOCAL_DETECTOR and LOCAL_DETECTOR.ready), "modelStatus": LOCAL_DETECTOR.reason if LOCAL_DETECTOR else "Detector unavailable", "frameWidth": FRAME_W, "frameHeight": FRAME_H})
             return
         if path == "/api/zones":
             if self.authorized():
@@ -469,9 +421,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.json(400, {"error": "Invalid request"}); return
         if path == "/api/frame":
             try:
-                result = analyze_frame(token, payload.get("pixels", ""))
+                result = analyze_frame(token, payload.get("frame", ""))
             except ValueError as exc:
                 self.json(400, {"error": str(exc)}); return
+            except Exception:
+                LOCAL_DETECTOR.ready = False
+                LOCAL_DETECTOR.reason = "Local model inference failed; restart after checking runtime compatibility"
+                self.json(503, {"error": "Local model inference failed"}); return
             self.json(200, result); return
         if path == "/api/calibrate":
             ANALYSIS.pop(token, None)

@@ -1,0 +1,5 @@
+# Install once during trusted provisioning; camera inference has no network path.
+torch>=2.6
+transformers>=4.52,<5
+pillow>=11
+huggingface_hub>=0.30,<2

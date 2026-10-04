@@ -3,11 +3,11 @@
   const video = $('video'), stage = $('video-stage'), overlay = $('overlay');
   const ctx = overlay.getContext('2d');
   const probe = document.createElement('canvas'), pctx = probe.getContext('2d', { willReadFrequently: true });
-  const SAMPLE_W = 160, SAMPLE_H = 88, CELL = 4;
-  probe.width = SAMPLE_W; probe.height = SAMPLE_H;
+  const FRAME_W = 640, FRAME_H = 360;
+  probe.width = FRAME_W; probe.height = FRAME_H;
   const events = [], spaces = [];
-  let csrf = '', running = false, raf = 0, lastAnalysis = 0, sendingFrame = false;
-  let sourceObjectUrl = null, cameraStream = null, drawingSpace = false, draftPoints = [], latestObjects = [];
+  let csrf = '', running = false, modelReady = false, modelStatus = 'Local model unavailable', raf = 0, lastAnalysis = 0, sendingFrame = false;
+  let sourceObjectUrl = null, cameraStream = null, drawingSpace = false, draftPoints = [], latestObjects = [], sourceStartedAt = 0;
 
   const pad = value => String(value).padStart(2, '0');
   const escapeHTML = value => String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
@@ -43,7 +43,8 @@
     const item = { ...event, time: clockText(), stamp: Date.now() };
     events.unshift(item); if (events.length > 35) events.pop(); renderEvents();
     const marker = document.createElement('i'); marker.className = 'timeline-mark';
-    marker.style.left = `${8 + Math.random() * 84}%`; $('timeline-markers').append(marker);
+    const position = video.duration && Number.isFinite(video.duration) ? video.currentTime / video.duration : (Date.now() - sourceStartedAt) / 3_600_000;
+    marker.style.left = `${Math.max(0, Math.min(100, position * 100))}%`; $('timeline-markers').append(marker);
   }
 
   function renderEvents() {
@@ -66,7 +67,7 @@
   }
 
   function renderSpaces() {
-    $('zone-count').textContent = spaces.length;
+    $('zone-count').textContent = spaces.length; $('zone-metric-count').textContent = spaces.length;
     const list = $('zones-list');
     list.innerHTML = spaces.length ? spaces.map((space, index) => `<div class="zone-row"><div class="zone-thumb thumb-restricted"><span>${String(index + 1).padStart(2, '0')}</span><i></i></div><div class="zone-copy"><strong>${escapeHTML(space.name)}</strong><small>Custom polygon · ${Number(space.events) || 0} entries</small></div><button class="zone-remove" data-zone-id="${Number(space.id)}" aria-label="Remove ${escapeHTML(space.name)}">×</button></div>`).join('') : '<div class="zones-empty">No restricted spaces configured. Add one to alert on objects entering it.</div>';
     list.querySelectorAll('[data-zone-id]').forEach(button => button.addEventListener('click', async () => {
@@ -97,28 +98,29 @@
       const color = object.danger === 'high' ? '#f0796e' : object.danger === 'medium' ? '#eab05d' : '#48d6c5';
       const x = object.x * overlay.width, y = object.y * overlay.height, w = object.w * overlay.width, h = object.h * overlay.height;
       ctx.strokeStyle = color; ctx.lineWidth = Math.max(2, overlay.width / 640); ctx.strokeRect(x, y, w, h);
-      const label = `OBJECT ${String(object.id).padStart(3, '0')} · ${object.danger.toUpperCase()}`;
+      const label = `${String(object.label || 'object').toUpperCase()} #${String(object.id).padStart(3, '0')} · ${object.danger.toUpperCase()}${object.stale ? ' · TRACKING' : ''}`;
       ctx.font = `${Math.max(11, overlay.width / 80)}px monospace`; const tw = ctx.measureText(label).width + 9;
       ctx.fillStyle = color; ctx.fillRect(x, Math.max(0, y - 17), tw, 17); ctx.fillStyle = '#071411'; ctx.fillText(label, x + 4, Math.max(12, y - 5));
     }
   }
 
   async function sendFrame() {
-    if (sendingFrame || !running || video.readyState < 2) return;
+    if (sendingFrame || !running || !modelReady || video.paused || video.readyState < 2) return;
     sendingFrame = true;
     try {
-      // The browser only samples a compact grayscale frame. Tracking, baseline
-      // comparison, object association, zone checks, and danger scoring run on
-      // the authenticated local server over TLS.
-      pctx.drawImage(video, 0, 0, SAMPLE_W, SAMPLE_H);
-      const rgba = pctx.getImageData(0, 0, SAMPLE_W, SAMPLE_H).data, pixels = new Uint8Array((SAMPLE_W / CELL) * (SAMPLE_H / CELL));
-      let target = 0;
-      for (let y = 1; y < SAMPLE_H; y += CELL) for (let x = 1; x < SAMPLE_W; x += CELL) {
-        const i = (y * SAMPLE_W + x) * 4; pixels[target++] = Math.round((rgba[i] * 3 + rgba[i + 1] * 6 + rgba[i + 2]) / 10);
-      }
-      const binary = String.fromCharCode(...pixels);
-      const result = await api('/api/frame', { method: 'POST', body: JSON.stringify({ pixels: btoa(binary) }) });
+      // Downsample before transmission; pixels never leave the local server.
+      const scale = Math.min(FRAME_W / video.videoWidth, FRAME_H / video.videoHeight, 1);
+      const frameWidth = Math.max(16, Math.round(video.videoWidth * scale));
+      const frameHeight = Math.max(16, Math.round(video.videoHeight * scale));
+      if (probe.width !== frameWidth || probe.height !== frameHeight) { probe.width = frameWidth; probe.height = frameHeight; }
+      pctx.drawImage(video, 0, 0, frameWidth, frameHeight);
+      const result = await api('/api/frame', { method: 'POST', body: JSON.stringify({ frame: probe.toDataURL('image/jpeg', 0.82) }) });
       latestObjects = result.objects; $('active-count').textContent = pad(latestObjects.length);
+      if (result.model === 'unavailable') {
+        $('signal-note').textContent = 'Local object model is not installed · review model setup';
+        $('frame-info').textContent = 'DETECTOR NOT INSTALLED';
+        $('calibrate-button').textContent = 'Model setup required';
+      }
       let zoneCountsChanged = false;
       for (const counts of result.zoneEvents || []) {
         const space = spaces.find(candidate => candidate.id === counts.id);
@@ -126,7 +128,9 @@
       }
       if (zoneCountsChanged) renderSpaces();
       for (const event of result.events) addInsight(event);
-      if (result.calibration < 100) {
+      if (result.model === 'unavailable') {
+        // Keep the explicit setup state; do not imply calibration is running.
+      } else if (result.calibration < 100) {
         $('calibrate-button').textContent = `Calibrating ${result.calibration}%`;
         $('signal-note').textContent = `Learning normal view · ${result.calibration}%`;
         $('frame-info').textContent = 'CALIBRATING NORMAL VIEW';
@@ -136,6 +140,10 @@
       drawOverlay();
     } catch (error) {
       console.error('Local analysis request failed', error);
+      if (error.message.includes('503')) {
+        modelReady = false;
+        $('system-status').innerHTML = '<i></i> LOCAL MODEL ERROR';
+      }
       $('signal-note').textContent = 'Local server analysis unavailable';
       $('frame-info').textContent = 'SERVER CONNECTION ERROR';
     } finally { sendingFrame = false; }
@@ -143,7 +151,7 @@
 
   function analyzeLoop(now) {
     if (!running) return;
-    if (now - lastAnalysis > 180) {
+    if (!video.paused && now - lastAnalysis > 180) {
       lastAnalysis = now; sendFrame();
       if (video.duration && Number.isFinite(video.duration)) {
         $('timeline-progress').style.width = `${(video.currentTime / video.duration) * 100}%`;
@@ -154,8 +162,9 @@
   }
 
   async function beginSource(kind, subtitle) {
-    running = true; latestObjects = []; $('play-toggle').textContent = 'Ⅱ';
+    running = true; latestObjects = []; sourceStartedAt = Date.now(); $('timeline-markers').replaceChildren(); $('play-toggle').textContent = 'Ⅱ';
     setSignal(kind, subtitle); $('calibrate-button').textContent = 'Calibrating…';
+    if (!modelReady) { $('signal-note').textContent = modelStatus; $('frame-info').textContent = 'MODEL SETUP REQUIRED'; $('calibrate-button').textContent = 'Model setup required'; }
     try { await api('/api/calibrate', { method: 'POST', body: '{}' }); }
     catch (error) { $('signal-note').textContent = `Local server unavailable: ${error.message}`; }
     video.play().catch(() => {}); cancelAnimationFrame(raf); raf = requestAnimationFrame(analyzeLoop);
@@ -188,7 +197,7 @@
     else { video.pause(); $('play-toggle').textContent = '▶'; }
   });
   $('fullscreen').addEventListener('click', () => { if (stage.requestFullscreen) stage.requestFullscreen(); });
-  $('clear-events').addEventListener('click', () => { events.length = 0; renderEvents(); });
+  $('clear-events').addEventListener('click', () => { events.length = 0; $('timeline-markers').replaceChildren(); renderEvents(); });
   $('calibrate-button').addEventListener('click', async () => {
     if (!running) return;
     $('calibrate-button').textContent = 'Calibrating…';
@@ -227,7 +236,7 @@
     try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch (_) {}
     window.location.assign('/login');
   });
-  video.addEventListener('ended', () => { $('play-toggle').textContent = '▶'; });
+  video.addEventListener('ended', () => { latestObjects = []; $('active-count').textContent = '00'; drawOverlay(); $('play-toggle').textContent = '↻'; });
   video.addEventListener('play', () => { if (running) $('play-toggle').textContent = 'Ⅱ'; });
   window.addEventListener('resize', drawOverlay);
 
@@ -236,6 +245,9 @@
       const session = await api('/api/session'); csrf = session.csrf;
       const data = await api('/api/zones'); spaces.splice(0, spaces.length, ...data.zones);
       renderSpaces(); renderEvents(); setSignal('Waiting for signal', 'Connect a source · processing remains on this server');
+      modelReady = Boolean(session.modelReady); modelStatus = session.modelStatus;
+      $('system-status').innerHTML = modelReady ? '<i></i> LOCAL MODEL READY' : '<i></i> MODEL SETUP REQUIRED';
+      if (!session.modelReady) { $('signal-note').textContent = session.modelStatus; $('frame-info').textContent = 'MODEL SETUP REQUIRED'; }
     } catch (error) {
       $('signal-note').textContent = 'Unable to initialize secure local session'; console.error(error);
     }
