@@ -14,7 +14,7 @@ Omniscient is local-first. The service has no telemetry or third-party runtime c
 
 ## Data flow
 
-The current prototype captures/decode frames in the browser because no server-side video decoder is included. It reduces each frame to an 880-byte grayscale sample and posts that sample to the same-origin HTTPS server. Server-side analysis is performed in memory; the sample is not written to disk. This is local network traffic, not cloud traffic. Direct RTSP ingestion and an encrypted camera-secret store are not implemented yet; do not enter camera credentials into the browser prototype.
+The current prototype captures and decodes frames in the browser because no server-side video decoder is included. It resizes each frame and posts JPEG bytes to the same-origin HTTPS server. The server derives a 880-byte grayscale sample for calibration and scene-change checks, and passes the JPEG through a local process pipe for object inference. Frames and samples are not written to disk. This is local network traffic, not cloud traffic. Direct RTSP ingestion and an encrypted camera-secret store are not implemented yet; do not enter camera credentials into the browser prototype.
 
 ## Authentication and transport
 

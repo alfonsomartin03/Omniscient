@@ -2,11 +2,11 @@
   const $ = id => document.getElementById(id);
   const video = $('video'), stage = $('video-stage'), overlay = $('overlay');
   const ctx = overlay.getContext('2d');
-  const probe = document.createElement('canvas'), pctx = probe.getContext('2d', { willReadFrequently: true });
+  const probe = document.createElement('canvas'), pctx = probe.getContext('2d');
   const FRAME_W = 640, FRAME_H = 360;
   probe.width = FRAME_W; probe.height = FRAME_H;
   const events = [], spaces = [];
-  let csrf = '', running = false, modelReady = false, modelStatus = 'Local model unavailable', raf = 0, lastAnalysis = 0, sendingFrame = false;
+  let csrf = '', running = false, modelReady = false, modelStatus = 'Local model unavailable', analysisTimer = 0, sourceGeneration = 0;
   let sourceObjectUrl = null, cameraStream = null, drawingSpace = false, draftPoints = [], latestObjects = [], sourceStartedAt = 0;
 
   const pad = value => String(value).padStart(2, '0');
@@ -18,11 +18,12 @@
   async function api(path, options = {}) {
     const headers = new Headers(options.headers || {});
     if (options.method && options.method !== 'GET') {
-      headers.set('Content-Type', 'application/json');
+      headers.set('Content-Type', options.body instanceof Blob ? 'image/jpeg' : 'application/json');
       headers.set('X-Omni-CSRF', csrf);
     }
     const response = await fetch(path, { ...options, headers, credentials: 'same-origin', cache: 'no-store', redirect: 'error' });
     if (response.status === 401) { window.location.assign('/login'); throw new Error('Session expired'); }
+    if (response.status === 429 && path === '/api/frame') return { busy: true };
     if (!response.ok) throw new Error(`Local server returned ${response.status}`);
     return response.json();
   }
@@ -44,7 +45,9 @@
     events.unshift(item); if (events.length > 35) events.pop(); renderEvents();
     const marker = document.createElement('i'); marker.className = 'timeline-mark';
     const position = video.duration && Number.isFinite(video.duration) ? video.currentTime / video.duration : (Date.now() - sourceStartedAt) / 3_600_000;
-    marker.style.left = `${Math.max(0, Math.min(100, position * 100))}%`; $('timeline-markers').append(marker);
+    marker.style.left = `${Math.max(0, Math.min(100, position * 100))}%`;
+    const markers = $('timeline-markers'); markers.append(marker);
+    while (markers.childElementCount > 35) markers.firstElementChild.remove();
   }
 
   function renderEvents() {
@@ -79,7 +82,9 @@
 
   function drawOverlay() {
     if (!video.videoWidth || !video.videoHeight) return;
-    if (overlay.width !== video.videoWidth || overlay.height !== video.videoHeight) { overlay.width = video.videoWidth; overlay.height = video.videoHeight; }
+    const scale = Math.min(1280 / video.videoWidth, 720 / video.videoHeight, 1);
+    const width = Math.max(1, Math.round(video.videoWidth * scale)), height = Math.max(1, Math.round(video.videoHeight * scale));
+    if (overlay.width !== width || overlay.height !== height) { overlay.width = width; overlay.height = height; }
     ctx.clearRect(0, 0, overlay.width, overlay.height);
     for (const space of spaces) {
       if (space.points.length < 3) continue;
@@ -104,23 +109,20 @@
     }
   }
 
-  async function sendFrame() {
-    if (sendingFrame || !running || !modelReady || video.paused || video.readyState < 2) return;
-    sendingFrame = true;
+  async function sendFrame(generation) {
+    if (!running || !modelReady || video.paused || video.readyState < 2) return;
     try {
-      // Downsample before transmission; pixels never leave the local server.
+      // Encode a bounded JPEG; only the authenticated local endpoint receives it.
       const scale = Math.min(FRAME_W / video.videoWidth, FRAME_H / video.videoHeight, 1);
       const frameWidth = Math.max(16, Math.round(video.videoWidth * scale));
       const frameHeight = Math.max(16, Math.round(video.videoHeight * scale));
       if (probe.width !== frameWidth || probe.height !== frameHeight) { probe.width = frameWidth; probe.height = frameHeight; }
       pctx.drawImage(video, 0, 0, frameWidth, frameHeight);
-      const result = await api('/api/frame', { method: 'POST', body: JSON.stringify({ frame: probe.toDataURL('image/jpeg', 0.82) }) });
+      const frame = await new Promise(resolve => probe.toBlob(resolve, 'image/jpeg', 0.82));
+      if (!frame || generation !== sourceGeneration) return;
+      const result = await api('/api/frame', { method: 'POST', body: frame });
+      if (generation !== sourceGeneration || result.busy) return;
       latestObjects = result.objects; $('active-count').textContent = pad(latestObjects.length);
-      if (result.model === 'unavailable') {
-        $('signal-note').textContent = 'Local object model is not installed · review model setup';
-        $('frame-info').textContent = 'DETECTOR NOT INSTALLED';
-        $('calibrate-button').textContent = 'Model setup required';
-      }
       let zoneCountsChanged = false;
       for (const counts of result.zoneEvents || []) {
         const space = spaces.find(candidate => candidate.id === counts.id);
@@ -128,9 +130,7 @@
       }
       if (zoneCountsChanged) renderSpaces();
       for (const event of result.events) addInsight(event);
-      if (result.model === 'unavailable') {
-        // Keep the explicit setup state; do not imply calibration is running.
-      } else if (result.calibration < 100) {
+      if (result.calibration < 100) {
         $('calibrate-button').textContent = `Calibrating ${result.calibration}%`;
         $('signal-note').textContent = `Learning normal view · ${result.calibration}%`;
         $('frame-info').textContent = 'CALIBRATING NORMAL VIEW';
@@ -139,6 +139,7 @@
       }
       drawOverlay();
     } catch (error) {
+      if (generation !== sourceGeneration) return;
       console.error('Local analysis request failed', error);
       if (error.message.includes('503')) {
         modelReady = false;
@@ -146,28 +147,33 @@
       }
       $('signal-note').textContent = 'Local server analysis unavailable';
       $('frame-info').textContent = 'SERVER CONNECTION ERROR';
-    } finally { sendingFrame = false; }
+    }
   }
 
-  function analyzeLoop(now) {
-    if (!running) return;
-    if (!video.paused && now - lastAnalysis > 180) {
-      lastAnalysis = now; sendFrame();
-      if (video.duration && Number.isFinite(video.duration)) {
-        $('timeline-progress').style.width = `${(video.currentTime / video.duration) * 100}%`;
-        $('video-time').textContent = `${Math.floor(video.currentTime / 60)}:${pad(Math.floor(video.currentTime % 60))} / ${Math.floor(video.duration / 60)}:${pad(Math.floor(video.duration % 60))}`;
-      } else $('video-time').textContent = clockText();
-    }
-    raf = requestAnimationFrame(analyzeLoop);
+  async function analyzeLoop(generation) {
+    if (!running || generation !== sourceGeneration || video.paused) return;
+    await sendFrame(generation);
+    if (!running || generation !== sourceGeneration) return;
+    if (video.duration && Number.isFinite(video.duration)) {
+      $('timeline-progress').style.width = `${(video.currentTime / video.duration) * 100}%`;
+      $('video-time').textContent = `${Math.floor(video.currentTime / 60)}:${pad(Math.floor(video.currentTime % 60))} / ${Math.floor(video.duration / 60)}:${pad(Math.floor(video.duration % 60))}`;
+    } else $('video-time').textContent = clockText();
+    analysisTimer = setTimeout(() => analyzeLoop(generation), modelReady ? 350 : 1000);
   }
+
+  function stopAnalysis() { sourceGeneration++; clearTimeout(analysisTimer); analysisTimer = 0; }
 
   async function beginSource(kind, subtitle) {
+    stopAnalysis();
+    const generation = sourceGeneration;
     running = true; latestObjects = []; sourceStartedAt = Date.now(); $('timeline-markers').replaceChildren(); $('play-toggle').textContent = 'Ⅱ';
     setSignal(kind, subtitle); $('calibrate-button').textContent = 'Calibrating…';
     if (!modelReady) { $('signal-note').textContent = modelStatus; $('frame-info').textContent = 'MODEL SETUP REQUIRED'; $('calibrate-button').textContent = 'Model setup required'; }
     try { await api('/api/calibrate', { method: 'POST', body: '{}' }); }
     catch (error) { $('signal-note').textContent = `Local server unavailable: ${error.message}`; }
-    video.play().catch(() => {}); cancelAnimationFrame(raf); raf = requestAnimationFrame(analyzeLoop);
+    if (generation !== sourceGeneration) return;
+    try { await video.play(); analysisTimer = setTimeout(() => analyzeLoop(generation), 0); }
+    catch (_) { $('play-toggle').textContent = '▶'; }
   }
 
   $('upload-trigger').addEventListener('click', () => $('file-input').click());
@@ -178,23 +184,29 @@
     if (cameraStream) { cameraStream.getTracks().forEach(track => track.stop()); cameraStream = null; }
     sourceObjectUrl = URL.createObjectURL(file); video.srcObject = null; video.src = sourceObjectUrl; video.load();
     video.onloadedmetadata = () => beginSource(file.name, 'Recorded video · analysis on local server');
-    video.onerror = () => { running = false; setSignal('Source error', 'This video could not be opened'); };
+    video.onerror = () => { stopAnalysis(); running = false; setSignal('Source error', 'This video could not be opened'); };
   });
   $('camera-trigger').addEventListener('click', async () => {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { addInsight({ level: 'medium', title: 'Camera unavailable', detail: 'Camera access requires HTTPS in a supported browser.' }); return; }
     try {
+      const nextStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+      if (cameraStream) cameraStream.getTracks().forEach(track => track.stop());
       if (sourceObjectUrl) { URL.revokeObjectURL(sourceObjectUrl); sourceObjectUrl = null; }
-      cameraStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+      cameraStream = nextStream;
       video.removeAttribute('src'); video.srcObject = cameraStream;
       video.onloadedmetadata = () => beginSource('Live camera', 'Camera feed · analysis on local server');
     } catch (error) {
       addInsight({ level: 'medium', title: 'Camera connection failed', detail: error.name === 'NotAllowedError' ? 'Camera permission was denied. Allow access and try again.' : 'No camera feed could be opened.' });
     }
   });
-  $('play-toggle').addEventListener('click', () => {
+  $('play-toggle').addEventListener('click', async () => {
     if (!running) return;
-    if (video.paused) { video.play(); $('play-toggle').textContent = 'Ⅱ'; }
-    else { video.pause(); $('play-toggle').textContent = '▶'; }
+    stopAnalysis();
+    if (video.paused) {
+      const generation = sourceGeneration;
+      try { await video.play(); analysisTimer = setTimeout(() => analyzeLoop(generation), 0); }
+      catch (_) { $('play-toggle').textContent = '▶'; }
+    } else { video.pause(); $('play-toggle').textContent = '▶'; }
   });
   $('fullscreen').addEventListener('click', () => { if (stage.requestFullscreen) stage.requestFullscreen(); });
   $('clear-events').addEventListener('click', () => { events.length = 0; $('timeline-markers').replaceChildren(); renderEvents(); });
@@ -236,7 +248,7 @@
     try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch (_) {}
     window.location.assign('/login');
   });
-  video.addEventListener('ended', () => { latestObjects = []; $('active-count').textContent = '00'; drawOverlay(); $('play-toggle').textContent = '↻'; });
+  video.addEventListener('ended', () => { stopAnalysis(); latestObjects = []; $('active-count').textContent = '00'; drawOverlay(); $('play-toggle').textContent = '↻'; });
   video.addEventListener('play', () => { if (running) $('play-toggle').textContent = 'Ⅱ'; });
   window.addEventListener('resize', drawOverlay);
 

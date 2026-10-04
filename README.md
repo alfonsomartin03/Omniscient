@@ -27,6 +27,8 @@ On first run, create an administrator password of at least 16 characters. The se
 
 If the local model is missing or fails to load, the dashboard reports that state and does not substitute motion blobs for labeled detections.
 
+The HTTPS process starts without loading PyTorch or the model. A separate local inference process starts after a calibrated feed needs detection and releases its memory after five minutes without inference. A quiet scene is checked again at least every 2.5 seconds; significant changes request a check sooner. Adjust `OMNI_MODEL_IDLE_SECONDS` (30–3600, default 300) and `OMNI_TORCH_THREADS` (1–4, default 2) for the host. The first detection after startup or idle shutdown takes longer while weights load. One inference process serves all authenticated sessions, so simultaneous frame requests may be briefly retried.
+
 The server binds to `127.0.0.1` by default. To allow selected devices on the home LAN, bind to the server's reserved LAN IP explicitly:
 
 ```sh
@@ -40,9 +42,10 @@ For a local DNS name, set `OMNI_ALLOWED_HOSTS` before first run, for example `OM
 - Browser-to-server traffic uses TLS 1.2 or later. There is no plaintext HTTP listener or cloud inference fallback.
 - Sessions use Secure, HttpOnly, SameSite=Strict cookies, eight-hour expiry, CSRF checks, and per-address login throttling. Static assets are allowlisted and protected by a restrictive CSP and browser security headers.
 - The browser decodes the selected local video or camera feed and sends resized JPEG frames through the authenticated HTTPS endpoint. RT-DETRv2 inference, class-aware track association, normal-scene comparison, danger scoring, and restricted-space checks run on the Omniscient host. Frames and events are currently held in memory and discarded at logout/server shutdown; video is not recorded.
+- Frame requests are paced after the prior response and sent as JPEG bytes. Calibration and scene-change checks use a small grayscale sample. Reusing the latest detections between checks keeps labels and boxes visible while reducing inference work.
 - At runtime, Transformers is set to offline mode and model loading uses `local_files_only=True`. There are no analytics, cloud APIs, remote fonts, or runtime model downloads. The one-time package/model setup above does make outbound requests for software and model files.
 - Password/configuration and TLS private-key files under `data/` have private filesystem permissions. Use full-disk encryption and protected backups on the host. TLS protects data in transit; it does not encrypt server memory or the model and configuration files at rest.
 
 ## Prototype limits
 
-The UI currently analyzes one browser-provided live camera or uploaded clip at a time. It does not yet manage multiple feeds or ingest RTSP/ONVIF cameras directly. The model recognizes its fixed COCO class list; it will not name arbitrary tools, unknown objects, or identify people. The normal-view comparison is a small grayscale scene baseline and its danger rating is a review aid, not a guarantee of threat. Validate camera coverage, lighting, and thresholds before relying on alerts. This prototype is not a safety-rated alarm system.
+The UI currently analyzes one browser-provided live camera or uploaded clip at a time. The browser tab and feed must remain open for continuous analysis; running the server alone does not monitor cameras. It does not yet manage multiple feeds or ingest RTSP/ONVIF cameras directly. The model recognizes its fixed COCO class list; it will not name arbitrary tools, unknown objects, or identify people. The normal-view comparison is a small grayscale scene baseline and its danger rating is a review aid, not a guarantee of threat. Validate camera coverage, lighting, and thresholds before relying on alerts. This prototype is not a safety-rated alarm system.

@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import http.cookies
 import http.server
+import io
 import ipaddress
 import json
 import os
@@ -23,7 +24,7 @@ import time
 import urllib.parse
 from pathlib import Path
 
-from vision import LOCAL_DETECTOR
+from vision import MODEL_WORKER, ModelBusy, ModelFailure, bbox_iou
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
@@ -34,7 +35,7 @@ STATIC = {"/": "index.html", "/index.html": "index.html", "/styles.css": "styles
 FRAME_W, FRAME_H = 40, 22
 FRAME_SIZE = FRAME_W * FRAME_H
 MAX_FRAME_W, MAX_FRAME_H = 960, 540
-MAX_BODY = 2_500_000
+MAX_BODY = 1_800_000
 SESSION_TTL = 8 * 60 * 60
 PBKDF2_ROUNDS = 600_000
 
@@ -185,80 +186,133 @@ def point_in_polygon(point: tuple[float, float], polygon: list[dict]) -> bool:
     return inside
 
 
-def _analyze_frame(session_id: str, encoded: str) -> dict:
-    if not isinstance(encoded, str) or not encoded.startswith("data:image/jpeg;base64,"):
-        raise ValueError("Expected a JPEG camera frame")
-    try:
-        frame_data = base64.b64decode(encoded.partition(",")[2], validate=True)
-    except (ValueError, TypeError):
-        raise ValueError("Invalid frame encoding")
-    if not frame_data or len(frame_data) > 1_800_000:
+def decode_gray_frame(frame_data: bytes) -> bytes:
+    if not frame_data or len(frame_data) > MAX_BODY:
         raise ValueError("Camera frame exceeds the permitted size")
-    if LOCAL_DETECTOR is None or not LOCAL_DETECTOR.ready:
-        return {"calibration": 0, "objects": [], "events": [], "zoneEvents": [{"id": z["id"], "events": z["events"]} for z in ZONES], "model": "unavailable"}
-    image, gray = LOCAL_DETECTOR.decode(frame_data, (MAX_FRAME_W, MAX_FRAME_H), (FRAME_W, FRAME_H))
-    state = ANALYSIS.setdefault(session_id, {"baseline_sum": [0] * FRAME_SIZE, "baseline_frames": 0, "baseline": None, "tracks": {}, "next_id": 1})
+    try:
+        from PIL import Image
+        with Image.open(io.BytesIO(frame_data)) as image:
+            if image.format != "JPEG":
+                raise ValueError("Expected a JPEG camera frame")
+            if not (16 <= image.width <= MAX_FRAME_W and 16 <= image.height <= MAX_FRAME_H):
+                raise ValueError("Camera frame dimensions are outside the permitted range")
+            return image.convert("L").resize((FRAME_W, FRAME_H)).tobytes()
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("Invalid JPEG camera frame") from exc
+
+
+def frame_result(calibration: int, objects=None, events=None) -> dict:
+    return {
+        "calibration": calibration,
+        "objects": objects or [],
+        "events": events or [],
+        "zoneEvents": [{"id": zone["id"], "events": zone["events"]} for zone in ZONES],
+    }
+
+
+def analyze_frame(session_id: str, frame_data: bytes) -> dict:
+    gray = decode_gray_frame(frame_data)
     now = time.monotonic()
-    if state["baseline"] is None:
-        state["baseline_frames"] += 1
-        for i, value in enumerate(gray):
-            state["baseline_sum"][i] += value
-        if state["baseline_frames"] < 30:
-            return {"calibration": round(state["baseline_frames"] / 30 * 100), "objects": [], "events": [], "zoneEvents": [{"id": z["id"], "events": z["events"]} for z in ZONES], "model": "ready"}
-        n = state["baseline_frames"]
-        state["baseline"] = bytes(round(value / n) for value in state["baseline_sum"])
-    anomaly = bytearray(abs(value - state["baseline"][i]) > 44 for i, value in enumerate(gray))
-    detections = LOCAL_DETECTOR.detect(image)
-    active, matched, output, events = state["tracks"], set(), [], []
-    for detection in detections[:40]:
-        box = detection["box"]
-        candidate, best_iou = None, 0.12
-        for track in active.values():
-            if track["id"] in matched or track["label"] != detection["label"]:
-                continue
-            overlap = LOCAL_DETECTOR.iou(track["box"], box)
-            if overlap > best_iou:
-                candidate, best_iou = track, overlap
-        x1, y1, x2, y2 = box
-        center = ((x1 + x2) / 2, (y1 + y2) / 2)
-        zone = next((item for item in ZONES if point_in_polygon(center, item["points"])), None)
-        gx1, gy1 = max(0, int(x1 * FRAME_W)), max(0, int(y1 * FRAME_H))
-        gx2, gy2 = min(FRAME_W, int(x2 * FRAME_W)), min(FRAME_H, int(y2 * FRAME_H))
-        cells = [(x, y) for y in range(gy1, max(gy1 + 1, gy2)) for x in range(gx1, max(gx1 + 1, gx2))]
-        changed_ratio = sum(anomaly[y * FRAME_W + x] for x, y in cells) / max(1, len(cells))
-        danger = "high" if zone else "medium" if changed_ratio > .16 else "low"
-        if candidate is None:
-            track_id = state["next_id"]
-            state["next_id"] += 1
-            candidate = {"id": track_id, "label": detection["label"], "box": box, "born": now, "last_seen": now, "zone_id": None, "danger": danger, "confidence": detection["confidence"]}
-            active[track_id] = candidate
-        else:
-            candidate["box"] = [old * .30 + new * .70 for old, new in zip(candidate["box"], box)]
-            candidate.update(last_seen=now, danger=danger, confidence=detection["confidence"])
-        if zone and candidate["zone_id"] != zone["id"]:
-            zone["events"] += 1
-            events.append({"level": "high", "title": f"{zone['name']} entry", "detail": f"{candidate['label']} entered a user-defined restricted space.", "trackId": candidate["id"]})
-        candidate["zone_id"] = zone["id"] if zone else None
-        matched.add(candidate["id"])
-        bx1, by1, bx2, by2 = candidate["box"]
-        output.append({"id": candidate["id"], "label": candidate["label"], "confidence": round(candidate["confidence"], 2), "x": bx1, "y": by1, "w": bx2 - bx1, "h": by2 - by1, "danger": danger})
-        # Scene-baseline anomalies create one medium insight per persistent track.
-        if not zone and danger == "medium" and candidate.get("alerted") is not True:
-            candidate["alerted"] = True
-            events.append({"level": "medium", "title": f"Unfamiliar {candidate['label']} detected", "detail": "This object differs from the camera's calibrated normal view. Review the feed for context.", "trackId": candidate["id"]})
-    for track_id in list(active):
-        track = active[track_id]
-        if track_id not in matched and now - track["last_seen"] <= 1.0:
-            bx1, by1, bx2, by2 = track["box"]
-            output.append({"id": track_id, "label": track["label"], "confidence": round(track["confidence"], 2), "x": bx1, "y": by1, "w": bx2 - bx1, "h": by2 - by1, "danger": track["danger"], "stale": True})
-        elif now - track["last_seen"] > 1.0:
-            del active[track_id]
-    return {"calibration": 100, "objects": output, "events": events, "zoneEvents": [{"id": z["id"], "events": z["events"]} for z in ZONES], "model": "ready"}
-
-
-def analyze_frame(session_id: str, encoded: str) -> dict:
     with STATE_LOCK:
-        return _analyze_frame(session_id, encoded)
+        state = ANALYSIS.setdefault(session_id, {
+            "baseline_sum": [0] * FRAME_SIZE,
+            "baseline_frames": 0,
+            "baseline": None,
+            "previous_gray": None,
+            "last_inference": 0.0,
+            "last_detections": [],
+            "tracks": {},
+            "next_id": 1,
+        })
+        if state["baseline"] is None:
+            state["baseline_frames"] += 1
+            for index, value in enumerate(gray):
+                state["baseline_sum"][index] += value
+            if state["baseline_frames"] >= 30:
+                count = state["baseline_frames"]
+                state["baseline"] = bytes(round(value / count) for value in state["baseline_sum"])
+                state["baseline_sum"] = None
+                state["previous_gray"] = gray
+            return frame_result(round(state["baseline_frames"] / 30 * 100))
+
+        previous = state["previous_gray"] or gray
+        delta = [abs(a - b) for a, b in zip(gray, previous)]
+        state["previous_gray"] = gray
+        age = now - state["last_inference"]
+        changed_cells = sum(value > 18 for value in delta)
+        # A quiet fixed camera only needs a periodic detector refresh. Substantial
+        # scene changes bypass that idle cadence so entries are seen promptly.
+        needs_detect = (not state["last_inference"] or age >= 2.5
+                        or (age >= 0.4 and (sum(delta) / FRAME_SIZE >= 3 or changed_cells >= 12)))
+        detections = state["last_detections"]
+
+    if needs_detect:
+        detections = MODEL_WORKER.detect(frame_data)
+
+    with STATE_LOCK:
+        if ANALYSIS.get(session_id) is not state:
+            return frame_result(0)
+        if needs_detect:
+            state["last_inference"] = time.monotonic()
+            state["last_detections"] = detections
+        anomaly = bytearray(abs(value - state["baseline"][i]) > 44 for i, value in enumerate(gray))
+        active, matched, output, events = state["tracks"], set(), [], []
+        for detection in detections[:40]:
+            box = detection["box"]
+            candidate, best_iou = None, 0.12
+            for track in active.values():
+                if track["id"] in matched or track["label"] != detection["label"]:
+                    continue
+                overlap = bbox_iou(track["box"], box)
+                if overlap > best_iou:
+                    candidate, best_iou = track, overlap
+            x1, y1, x2, y2 = box
+            center = ((x1 + x2) / 2, (y1 + y2) / 2)
+            zone = next((item for item in ZONES if point_in_polygon(center, item["points"])), None)
+            gx1, gy1 = max(0, min(FRAME_W - 1, int(x1 * FRAME_W))), max(0, min(FRAME_H - 1, int(y1 * FRAME_H)))
+            gx2, gy2 = max(gx1 + 1, min(FRAME_W, int(x2 * FRAME_W))), max(gy1 + 1, min(FRAME_H, int(y2 * FRAME_H)))
+            changed = sum(anomaly[y * FRAME_W + x] for y in range(gy1, gy2) for x in range(gx1, gx2))
+            changed_ratio = changed / ((gx2 - gx1) * (gy2 - gy1))
+            danger = "high" if zone else "medium" if changed_ratio > .16 else "low"
+            if candidate is None:
+                track_id = state["next_id"]
+                state["next_id"] += 1
+                candidate = {"id": track_id, "label": detection["label"], "box": box,
+                             "last_seen": now, "zone_id": None, "danger": danger,
+                             "confidence": detection["confidence"]}
+                active[track_id] = candidate
+            else:
+                candidate["box"] = [old * .30 + new * .70 for old, new in zip(candidate["box"], box)]
+                candidate.update(last_seen=now, danger=danger, confidence=detection["confidence"])
+            if zone and candidate["zone_id"] != zone["id"]:
+                zone["events"] += 1
+                events.append({"level": "high", "title": f"{zone['name']} entry",
+                               "detail": f"{candidate['label']} entered a user-defined restricted space.",
+                               "trackId": candidate["id"]})
+            candidate["zone_id"] = zone["id"] if zone else None
+            matched.add(candidate["id"])
+            bx1, by1, bx2, by2 = candidate["box"]
+            output.append({"id": candidate["id"], "label": candidate["label"],
+                           "confidence": round(candidate["confidence"], 2),
+                           "x": bx1, "y": by1, "w": bx2 - bx1, "h": by2 - by1, "danger": danger})
+            if not zone and danger == "medium" and not candidate.get("alerted"):
+                candidate["alerted"] = True
+                events.append({"level": "medium", "title": f"Unfamiliar {candidate['label']} detected",
+                               "detail": "This object differs from the camera's calibrated normal view. Review the feed for context.",
+                               "trackId": candidate["id"]})
+        for track_id in list(active):
+            track = active[track_id]
+            if track_id not in matched and now - track["last_seen"] <= 1.0:
+                bx1, by1, bx2, by2 = track["box"]
+                output.append({"id": track_id, "label": track["label"],
+                               "confidence": round(track["confidence"], 2),
+                               "x": bx1, "y": by1, "w": bx2 - bx1, "h": by2 - by1,
+                               "danger": track["danger"], "stale": True})
+            elif now - track["last_seen"] > 1.0:
+                del active[track_id]
+        return frame_result(100, output, events)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -304,33 +358,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise ValueError("Invalid content length")
         if length < 0 or length > MAX_BODY:
             raise ValueError("Request body is too large")
-        return self.rfile.read(length)
-
-    def same_origin(self) -> bool:
-        origin = self.headers.get("Origin")
-        if not origin:
-            return self.headers.get("Sec-Fetch-Site", "same-origin") == "same-origin"
-        try:
-            origin_url = urllib.parse.urlsplit(origin)
-            host_url = urllib.parse.urlsplit(f"//{self.headers.get('Host', '')}")
-            origin_port = origin_url.port or (443 if origin_url.scheme.lower() == "https" else 80)
-            return (
-                origin_url.scheme.lower() == "https"
-                and origin_url.hostname is not None
-                and host_url.hostname is not None
-                and hmac.compare_digest(origin_url.hostname.lower(), host_url.hostname.lower())
-                and origin_port == self.server.server_address[1]
-                and not origin_url.path
-                and not origin_url.query
-                and not origin_url.fragment
-            )
-        except ValueError:
-            return False
+        body = self.rfile.read(length)
+        if len(body) != length:
+            raise ValueError("Incomplete request body")
+        return body
 
     def valid_host(self) -> bool:
         try:
             parsed = urllib.parse.urlsplit(f"//{self.headers.get('Host', '')}")
-            return parsed.hostname is not None and parsed.hostname.lower() in {host.lower() for host in ALLOWED_HOSTS} and parsed.port == self.server.server_address[1]
+            return parsed.hostname is not None and parsed.hostname.lower() in ALLOWED_HOSTS and parsed.port == self.server.server_address[1]
         except ValueError:
             return False
 
@@ -341,15 +377,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             token = jar.get("__Host-omni_session").value if jar.get("__Host-omni_session") else ""
         except http.cookies.CookieError:
             token = ""
-        session = SESSIONS.get(token)
-        if not session:
-            return None, None
-        if time.monotonic() - session["last"] > SESSION_TTL:
-            SESSIONS.pop(token, None)
-            ANALYSIS.pop(token, None)
-            return None, None
-        session["last"] = time.monotonic()
-        return token, session
+        with STATE_LOCK:
+            session = SESSIONS.get(token)
+            if not session:
+                return None, None
+            now = time.monotonic()
+            if now - session["last"] > SESSION_TTL:
+                SESSIONS.pop(token, None)
+                ANALYSIS.pop(token, None)
+                return None, None
+            session["last"] = now
+            return token, session
 
     def authorized(self, csrf=False):
         token, session = self.session()
@@ -363,13 +401,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def login_page(self, status=200, error=""):
         now = time.monotonic()
-        for token, item in list(LOGIN_NONCES.items()):
-            if item["expires"] <= now:
-                LOGIN_NONCES.pop(token, None)
-        while len(LOGIN_NONCES) >= 128:
-            LOGIN_NONCES.pop(next(iter(LOGIN_NONCES)))
-        nonce = secrets.token_urlsafe(32)
-        LOGIN_NONCES[nonce] = {"expires": now + 300, "host": self.headers.get("Host", "").lower()}
+        with STATE_LOCK:
+            for token, item in list(LOGIN_NONCES.items()):
+                if item["expires"] <= now:
+                    LOGIN_NONCES.pop(token, None)
+            while len(LOGIN_NONCES) >= 128:
+                LOGIN_NONCES.pop(next(iter(LOGIN_NONCES)))
+            nonce = secrets.token_urlsafe(32)
+            LOGIN_NONCES[nonce] = {"expires": now + 300, "host": self.headers.get("Host", "").lower()}
         cookie = f"__Host-omni_login={nonce}; Path=/; Max-Age=300; HttpOnly; Secure; SameSite=Strict"
         body = LOGIN_PAGE.replace("__ERROR__", error).replace("__NONCE__", nonce).encode()
         self.respond(status, body, "text/html; charset=utf-8", {"Set-Cookie": cookie})
@@ -378,7 +417,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self.valid_host():
             self.respond(400, b"Invalid host", "text/plain; charset=utf-8"); return
         path = urllib.parse.urlsplit(self.path).path
-        token, _ = self.session()
+        token, session = self.session()
         if path == "/login":
             if token:
                 self.send_response(303); self.security_headers(); self.send_header("Location", "/"); self.send_header("Cache-Control", "no-store"); self.end_headers(); return
@@ -389,12 +428,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_response(303); self.security_headers(); self.send_header("Location", "/login"); self.send_header("Cache-Control", "no-store"); self.end_headers(); return
             file_path = ROOT / STATIC[path]
             content_type = "text/html; charset=utf-8" if path.endswith("html") or path == "/" else "text/css; charset=utf-8" if path.endswith("css") else "text/javascript; charset=utf-8"
-            self.respond(200, file_path.read_bytes(), content_type, {"X-Omni-CSRF": SESSIONS[token]["csrf"]})
+            self.respond(200, file_path.read_bytes(), content_type, {"X-Omni-CSRF": session["csrf"]})
             return
         if path == "/api/session":
             authorized = self.authorized()
             if authorized:
-                self.json(200, {"csrf": authorized[1]["csrf"], "serverAnalysis": True, "modelReady": bool(LOCAL_DETECTOR and LOCAL_DETECTOR.ready), "modelStatus": LOCAL_DETECTOR.reason if LOCAL_DETECTOR else "Detector unavailable", "frameWidth": FRAME_W, "frameHeight": FRAME_H})
+                self.json(200, {"csrf": authorized[1]["csrf"], "modelReady": MODEL_WORKER.available, "modelStatus": MODEL_WORKER.status})
             return
         if path == "/api/zones":
             if self.authorized():
@@ -413,28 +452,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not authorized:
             return
         token, _ = authorized
+        if path == "/api/frame":
+            if self.headers.get("Content-Type", "").split(";", 1)[0].lower() != "image/jpeg":
+                self.json(415, {"error": "Expected a JPEG camera frame"}); return
+            try:
+                result = analyze_frame(token, self.body())
+            except ValueError as exc:
+                self.json(400, {"error": str(exc)}); return
+            except ModelBusy:
+                self.json(429, {"busy": True}, {"Retry-After": "1"}); return
+            except ModelFailure:
+                self.json(503, {"error": "Local model inference failed"}); return
+            self.json(200, result); return
         try:
             payload = json.loads(self.body() or b"{}")
         except (ValueError, json.JSONDecodeError):
             self.json(400, {"error": "Invalid request"}); return
         if not isinstance(payload, dict):
             self.json(400, {"error": "Invalid request"}); return
-        if path == "/api/frame":
-            try:
-                result = analyze_frame(token, payload.get("frame", ""))
-            except ValueError as exc:
-                self.json(400, {"error": str(exc)}); return
-            except Exception:
-                LOCAL_DETECTOR.ready = False
-                LOCAL_DETECTOR.reason = "Local model inference failed; restart after checking runtime compatibility"
-                self.json(503, {"error": "Local model inference failed"}); return
-            self.json(200, result); return
         if path == "/api/calibrate":
-            ANALYSIS.pop(token, None)
+            with STATE_LOCK: ANALYSIS.pop(token, None)
             self.json(200, {"ok": True}); return
         if path == "/api/logout":
-            SESSIONS.pop(token, None)
-            ANALYSIS.pop(token, None)
+            with STATE_LOCK:
+                SESSIONS.pop(token, None)
+                ANALYSIS.pop(token, None)
             self.respond(200, b'{"ok":true}', extra={"Set-Cookie": "__Host-omni_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict"}); return
         if path == "/api/zones":
             name = str(payload.get("name", "Restricted space"))[:48]
@@ -497,7 +539,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             cookie_nonce = cookie.get("__Host-omni_login").value if cookie.get("__Host-omni_login") else ""
         except http.cookies.CookieError:
             cookie_nonce = ""
-        nonce_record = LOGIN_NONCES.pop(cookie_nonce, None)
+        with STATE_LOCK:
+            nonce_record = LOGIN_NONCES.pop(cookie_nonce, None)
         if (not nonce_record or nonce_record["expires"] <= now
                 or nonce_record["host"] != self.headers.get("Host", "").lower()
                 or not hmac.compare_digest(cookie_nonce, submitted_nonce)):
@@ -506,16 +549,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if len(password) > 1024:
             password = ""
         if password_matches(password, read_json(AUTH_FILE, {})):
-            for old_token, session in list(SESSIONS.items()):
-                if now - session["last"] > SESSION_TTL:
-                    SESSIONS.pop(old_token, None)
-                    ANALYSIS.pop(old_token, None)
-            if len(SESSIONS) >= 8:
+            with STATE_LOCK:
+                for old_token, session in list(SESSIONS.items()):
+                    if now - session["last"] > SESSION_TTL:
+                        SESSIONS.pop(old_token, None)
+                        ANALYSIS.pop(old_token, None)
+                if len(SESSIONS) >= 8:
+                    full = True
+                else:
+                    full = False
+                    LOGIN_FAILURES.pop(ip, None)
+                    token = secrets.token_urlsafe(32)
+                    SESSIONS[token] = {"csrf": secrets.token_urlsafe(32), "last": now}
+            if full:
                 self.login_page(429, "Maximum active sessions reached. Sign out elsewhere first.")
                 return
-            LOGIN_FAILURES.pop(ip, None)
-            token = secrets.token_urlsafe(32)
-            SESSIONS[token] = {"csrf": secrets.token_urlsafe(32), "last": now}
             cookie = f"__Host-omni_session={token}; Path=/; Max-Age={SESSION_TTL}; HttpOnly; Secure; SameSite=Strict"
             self.send_response(303); self.security_headers(); self.send_header("Location", "/"); self.send_header("Set-Cookie", cookie); self.send_header("Set-Cookie", "__Host-omni_login=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict"); self.send_header("Cache-Control", "no-store"); self.end_headers(); return
         failures += 1
@@ -533,8 +581,28 @@ class BoundedHTTPServer(http.server.ThreadingHTTPServer):
     request_queue_size = 16
 
     def __init__(self, address, handler):
-        self._request_slots = threading.BoundedSemaphore(24)
+        self._request_slots = threading.BoundedSemaphore(12)
+        self._last_housekeeping = time.monotonic()
         super().__init__(address, handler)
+
+    def service_actions(self):
+        now = time.monotonic()
+        if now - self._last_housekeeping < 30:
+            return
+        self._last_housekeeping = now
+        MODEL_WORKER.unload_if_idle()
+        with STATE_LOCK:
+            for token, session in list(SESSIONS.items()):
+                if now - session["last"] > SESSION_TTL:
+                    SESSIONS.pop(token, None)
+                    ANALYSIS.pop(token, None)
+            for token, item in list(LOGIN_NONCES.items()):
+                if item["expires"] <= now:
+                    LOGIN_NONCES.pop(token, None)
+
+    def server_close(self):
+        MODEL_WORKER.close()
+        super().server_close()
 
     def process_request(self, request, client_address):
         if not self._request_slots.acquire(blocking=False):
@@ -577,7 +645,7 @@ def main():
     except ValueError:
         raise SystemExit("OMNI_BIND must be an IP address. Default is loopback-only (127.0.0.1).")
     port = int(os.environ.get("OMNI_PORT", "8443"))
-    ALLOWED_HOSTS = {"localhost", "127.0.0.1", "::1", socket.gethostname()}
+    ALLOWED_HOSTS = {"localhost", "127.0.0.1", "::1", bind.lower(), socket.gethostname().lower()}
     ALLOWED_HOSTS.update(extra_hostnames())
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None):
