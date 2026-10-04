@@ -1,200 +1,164 @@
 (() => {
-  const $ = (id) => document.getElementById(id);
-  const video = $('video');
-  const stage = $('video-stage');
-  const overlay = $('overlay');
+  const $ = id => document.getElementById(id);
+  const video = $('video'), stage = $('video-stage'), overlay = $('overlay');
   const ctx = overlay.getContext('2d');
-  const probe = document.createElement('canvas');
-  const pctx = probe.getContext('2d', { willReadFrequently: true });
-  const W = 160, H = 90, CELL = 4;
-  probe.width = W; probe.height = H;
-  const tracks = new Map();
-  const events = [];
-  let previous = null, nextId = 1, running = false, raf = 0, lastAnalysis = 0;
-  let entryEvents = 0, restrictedEvents = 0, sourceObjectUrl = null, cameraStream = null;
-  let eventCooldown = 0;
+  const probe = document.createElement('canvas'), pctx = probe.getContext('2d', { willReadFrequently: true });
+  const SAMPLE_W = 160, SAMPLE_H = 88, CELL = 4;
+  probe.width = SAMPLE_W; probe.height = SAMPLE_H;
+  const events = [], spaces = [];
+  let csrf = '', running = false, raf = 0, lastAnalysis = 0, sendingFrame = false;
+  let sourceObjectUrl = null, cameraStream = null, drawingSpace = false, draftPoints = [], latestObjects = [];
 
-  const pad = (value) => String(value).padStart(2, '0');
+  const pad = value => String(value).padStart(2, '0');
+  const escapeHTML = value => String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
   const clockText = () => new Date().toLocaleTimeString([], { hour12: false });
   function updateClock() { $('clock').textContent = clockText(); $('stage-time').textContent = clockText(); }
   updateClock(); setInterval(updateClock, 1000);
 
+  async function api(path, options = {}) {
+    const headers = new Headers(options.headers || {});
+    if (options.method && options.method !== 'GET') {
+      headers.set('Content-Type', 'application/json');
+      headers.set('X-Omni-CSRF', csrf);
+    }
+    const response = await fetch(path, { ...options, headers, credentials: 'same-origin', cache: 'no-store', redirect: 'error' });
+    if (response.status === 401) { window.location.assign('/login'); throw new Error('Session expired'); }
+    if (!response.ok) throw new Error(`Local server returned ${response.status}`);
+    return response.json();
+  }
+
   function setSignal(label, subtitle) {
-    $('feed-label').textContent = label.toUpperCase();
-    $('feed-subtitle').textContent = subtitle;
-    $('source-status').textContent = label;
-    $('signal-note').textContent = subtitle;
+    $('feed-label').textContent = label.toUpperCase(); $('feed-subtitle').textContent = subtitle;
+    $('source-status').textContent = label; $('signal-note').textContent = subtitle;
     $('source-dot').classList.toggle('on', running);
-    $('signal-health').innerHTML = running ? 'GOOD<small> · 30 FPS</small>' : '—<small> NO SIGNAL</small>';
+    $('signal-health').innerHTML = running ? 'LOCAL<small> · HTTPS</small>' : '—<small> NO SIGNAL</small>';
     $('signal-health').style.color = running ? 'var(--green)' : '';
-    $('frame-info').textContent = running ? 'MOTION ANALYSIS ACTIVE' : 'ANALYSIS STANDBY';
-    $('empty-state').classList.toggle('hidden', running);
-    stage.classList.toggle('has-video', running);
-    document.querySelectorAll('.zone').forEach(zone => zone.classList.toggle('visible', running));
+    $('frame-info').textContent = running ? 'SERVER ANALYSIS ACTIVE' : 'ANALYSIS STANDBY';
+    $('empty-state').classList.toggle('hidden', running); stage.classList.toggle('has-video', running);
     document.querySelector('.panel-live-dot').style.background = running ? 'var(--green)' : '';
-    $('zone-count').textContent = '02';
+    $('calibrate-button').disabled = !running;
   }
 
-  function beginSource(kind, subtitle) {
-    previous = null; tracks.clear(); nextId = 1;
-    running = true;
-    $('play-toggle').textContent = 'Ⅱ';
-    $('signal-health').style.color = 'var(--green)';
-    setSignal(kind, subtitle);
-    video.play().catch(() => {});
-    cancelAnimationFrame(raf); raf = requestAnimationFrame(analyzeLoop);
-  }
-
-  function addInsight(level, title, detail, trackId = null) {
-    const now = Date.now();
-    if (now - eventCooldown < 900) return;
-    eventCooldown = now;
-    const time = clockText();
-    const event = { level, title, detail, trackId, time, stamp: now };
-    events.unshift(event); if (events.length > 35) events.pop();
-    renderEvents();
+  function addInsight(event) {
+    const item = { ...event, time: clockText(), stamp: Date.now() };
+    events.unshift(item); if (events.length > 35) events.pop(); renderEvents();
     const marker = document.createElement('i'); marker.className = 'timeline-mark';
     marker.style.left = `${8 + Math.random() * 84}%`; $('timeline-markers').append(marker);
-    if (title.includes('Entry')) { entryEvents++; $('zone-entry-events').textContent = entryEvents; }
-    if (title.includes('Restricted')) { restrictedEvents++; $('zone-restricted-events').textContent = restrictedEvents; }
   }
 
   function renderEvents() {
-    $('event-count').textContent = pad(events.length);
-    $('nav-event-count').textContent = events.length;
-    $('insight-count').textContent = events.length;
-    $('event-note').textContent = events.length ? 'Activity detected on this feed' : 'No events recorded';
+    $('event-count').textContent = pad(events.length); $('nav-event-count').textContent = events.length;
+    $('insight-count').textContent = events.length; $('event-note').textContent = events.length ? 'Activity detected on this feed' : 'No events recorded';
     const list = $('insights-list');
-    if (!events.length) {
-      list.innerHTML = '<div class="insights-empty"><span>⌁</span><strong>All quiet</strong><p>Security insights will appear here as activity is detected.</p></div>';
-      renderActivityChart();
-      return;
-    }
-    list.innerHTML = events.map(event => `<article class="insight-item"><div class="insight-top"><span class="severity ${event.level}">${event.level.toUpperCase()}</span><span class="insight-time">${event.time}</span></div><strong>${event.title}</strong><p>${event.detail}</p>${event.trackId ? `<div class="insight-track">TRACK ${String(event.trackId).padStart(3, '0')}</div>` : ''}</article>`).join('');
+    list.innerHTML = events.length ? events.map(event => {
+      const level = ['info', 'medium', 'high'].includes(event.level) ? event.level : 'info';
+      return `<article class="insight-item"><div class="insight-top"><span class="severity ${level}">${level.toUpperCase()}</span><span class="insight-time">${escapeHTML(event.time)}</span></div><strong>${escapeHTML(event.title)}</strong><p>${escapeHTML(event.detail)}</p>${event.trackId ? `<div class="insight-track">OBJECT ${Number(event.trackId).toString().padStart(3, '0')}</div>` : ''}</article>`;
+    }).join('') : '<div class="insights-empty"><span>⌁</span><strong>All quiet</strong><p>Security insights will appear here as activity is detected.</p></div>';
     renderActivityChart();
   }
 
   function renderActivityChart() {
-    const line = $('chart-line'), fill = $('chart-fill');
-    if (!line || !fill) return;
+    const line = $('chart-line'), fill = $('chart-fill'); if (!line || !fill) return;
     const counts = new Array(24).fill(0);
-    for (const event of events) {
-      const date = new Date(event.stamp);
-      if (date.toDateString() === new Date().toDateString()) counts[date.getHours()]++;
-    }
+    for (const event of events) { const date = new Date(event.stamp); if (date.toDateString() === new Date().toDateString()) counts[date.getHours()]++; }
     const max = Math.max(1, ...counts), points = counts.map((count, hour) => `${Math.round(hour * 30)},${Math.round(105 - count / max * 76)}`);
-    const path = `M${points.join(' L')}`;
-    line.setAttribute('d', path);
-    fill.setAttribute('d', `${path} L720,118 L0,118Z`);
+    const path = `M${points.join(' L')}`; line.setAttribute('d', path); fill.setAttribute('d', `${path} L720,118 L0,118Z`);
   }
 
-  function classifyZone(x) { return x < W * .34 ? 'entry' : x > W * .66 ? 'restricted' : 'center'; }
-  function detectMotion() {
-    pctx.drawImage(video, 0, 0, W, H);
-    const data = pctx.getImageData(0, 0, W, H).data;
-    const cols = W / CELL, rows = H / CELL, size = cols * rows;
-    const current = new Uint8Array(size);
-    for (let gy = 0; gy < rows; gy++) for (let gx = 0; gx < cols; gx++) {
-      const i = ((gy * CELL + 1) * W + gx * CELL + 1) * 4;
-      const lum = (data[i] * 3 + data[i + 1] * 6 + data[i + 2]) / 10;
-      current[gy * cols + gx] = lum;
-    }
-    if (!previous) { previous = current; return []; }
-    const moving = new Uint8Array(size);
-    let movingCount = 0;
-    for (let i = 0; i < size; i++) {
-      if (Math.abs(current[i] - previous[i]) > 25) { moving[i] = 1; movingCount++; }
-    }
-    previous = current;
-    // A global exposure change usually means camera auto-adjustment, not a moving object.
-    if (movingCount > size * .46) return [];
-    const seen = new Uint8Array(size), boxes = [];
-    for (let start = 0; start < size; start++) {
-      if (!moving[start] || seen[start]) continue;
-      const queue = [start]; seen[start] = 1;
-      let minX = cols, minY = rows, maxX = 0, maxY = 0, count = 0, sumX = 0, sumY = 0;
-      for (let q = 0; q < queue.length; q++) {
-        const index = queue[q], x = index % cols, y = (index / cols) | 0;
-        count++; minX = Math.min(minX, x); maxX = Math.max(maxX, x); minY = Math.min(minY, y); maxY = Math.max(maxY, y); sumX += x; sumY += y;
-        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
-          if (!dx && !dy) continue;
-          const nx = x + dx, ny = y + dy, ni = ny * cols + nx;
-          if (nx >= 0 && nx < cols && ny >= 0 && ny < rows && moving[ni] && !seen[ni]) { seen[ni] = 1; queue.push(ni); }
-        }
-      }
-      if (count >= 5 && maxX - minX >= 1 && maxY - minY >= 1) boxes.push({ x: minX * CELL, y: minY * CELL, w: (maxX - minX + 1) * CELL, h: (maxY - minY + 1) * CELL, cx: sumX / count, cy: sumY / count, area: count });
-    }
-    return boxes.sort((a, b) => b.area - a.area).slice(0, 8);
+  function renderSpaces() {
+    $('zone-count').textContent = spaces.length;
+    const list = $('zones-list');
+    list.innerHTML = spaces.length ? spaces.map((space, index) => `<div class="zone-row"><div class="zone-thumb thumb-restricted"><span>${String(index + 1).padStart(2, '0')}</span><i></i></div><div class="zone-copy"><strong>${escapeHTML(space.name)}</strong><small>Custom polygon · ${Number(space.events) || 0} entries</small></div><button class="zone-remove" data-zone-id="${Number(space.id)}" aria-label="Remove ${escapeHTML(space.name)}">×</button></div>`).join('') : '<div class="zones-empty">No restricted spaces configured. Add one to alert on objects entering it.</div>';
+    list.querySelectorAll('[data-zone-id]').forEach(button => button.addEventListener('click', async () => {
+      try { const result = await api(`/api/zones/${button.dataset.zoneId}`, { method: 'DELETE', body: '{}' }); spaces.splice(0, spaces.length, ...result.zones); renderSpaces(); drawOverlay(); }
+      catch (error) { addInsight({ level: 'medium', title: 'Server action failed', detail: error.message }); }
+    }));
+    drawOverlay();
   }
 
-  function updateTracks(boxes) {
-    const now = Date.now(), matched = new Set();
-    for (const box of boxes) {
-      let candidate = null, distance = 14;
-      for (const track of tracks.values()) {
-        if (matched.has(track.id)) continue;
-        const d = Math.hypot(track.cx - box.cx, track.cy - box.cy);
-        if (d < distance) { candidate = track; distance = d; }
-      }
-      const zone = classifyZone(box.cx * CELL);
-      if (!candidate) {
-        candidate = { id: nextId++, cx: box.cx, cy: box.cy, born: now, lastSeen: now, zone, box, dwellAlerted: false, zoneAlerted: false };
-        tracks.set(candidate.id, candidate);
-        if (zone === 'center') addInsight('info', 'Motion detected', 'Movement detected in the central area of the frame.', candidate.id);
-        if (zone === 'restricted') {
-          candidate.zoneAlerted = true;
-          addInsight('alert', 'Restricted area activity', 'Motion track first appeared inside the restricted zone. Review the clip for context.', candidate.id);
-        } else if (zone === 'entry') {
-          candidate.zoneAlerted = true;
-          addInsight('warning', 'Entry zone activity', 'Motion track first appeared inside the entry zone.', candidate.id);
-        }
-      } else {
-        const oldZone = candidate.zone;
-        candidate.cx = box.cx; candidate.cy = box.cy; candidate.zone = zone; candidate.box = box; candidate.lastSeen = now;
-        if (zone !== oldZone && zone !== 'center' && !candidate.zoneAlerted) {
-          candidate.zoneAlerted = true;
-          const restricted = zone === 'restricted';
-          addInsight(restricted ? 'alert' : 'warning', restricted ? 'Restricted area activity' : 'Entry zone activity', `Track moved into the ${zone === 'entry' ? 'entry' : 'restricted'} zone. Review the clip for context.`, candidate.id);
-        }
-        if (now - candidate.born > 8000 && !candidate.dwellAlerted) {
-          candidate.dwellAlerted = true;
-          addInsight(zone === 'restricted' ? 'alert' : 'warning', 'Extended presence', `Track remained visible for more than 8 seconds in the ${zone === 'center' ? 'central' : zone} area.`, candidate.id);
-        }
-      }
-      matched.add(candidate.id);
-    }
-    for (const [id, track] of tracks) if (now - track.lastSeen > 1200) tracks.delete(id);
-    $('active-count').textContent = pad(tracks.size);
-    drawTracks();
-  }
-
-  function drawTracks() {
-    const bounds = overlay.getBoundingClientRect();
-    if (!bounds.width || !bounds.height || !video.videoWidth) return;
+  function drawOverlay() {
+    if (!video.videoWidth || !video.videoHeight) return;
     if (overlay.width !== video.videoWidth || overlay.height !== video.videoHeight) { overlay.width = video.videoWidth; overlay.height = video.videoHeight; }
     ctx.clearRect(0, 0, overlay.width, overlay.height);
-    for (const track of tracks.values()) {
-      const b = track.box, zone = track.zone;
-      ctx.strokeStyle = zone === 'restricted' ? '#f0b65f' : '#48d6c5'; ctx.lineWidth = Math.max(2, video.videoWidth / 640);
-      ctx.strokeRect(b.x * video.videoWidth / W, b.y * video.videoHeight / H, b.w * video.videoWidth / W, b.h * video.videoHeight / H);
-      const label = `TRACK ${String(track.id).padStart(3, '0')}`;
-      ctx.font = `${Math.max(11, video.videoWidth / 80)}px monospace`;
-      const x = b.x * video.videoWidth / W, y = Math.max(15, b.y * video.videoHeight / H - 4), tw = ctx.measureText(label).width + 9;
-      ctx.fillStyle = zone === 'restricted' ? '#eab05d' : '#48d6c5'; ctx.fillRect(x, y - 15, tw, 15); ctx.fillStyle = '#071411'; ctx.fillText(label, x + 4, y - 4);
+    for (const space of spaces) {
+      if (space.points.length < 3) continue;
+      ctx.beginPath(); ctx.moveTo(space.points[0].x * overlay.width, space.points[0].y * overlay.height);
+      for (const point of space.points.slice(1)) ctx.lineTo(point.x * overlay.width, point.y * overlay.height);
+      ctx.closePath(); ctx.fillStyle = '#eab05d15'; ctx.fill(); ctx.strokeStyle = '#eab05d'; ctx.lineWidth = Math.max(2, overlay.width / 640); ctx.setLineDash([7, 5]); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = '#eab05d'; ctx.font = `${Math.max(11, overlay.width / 80)}px monospace`; ctx.fillText(String(space.name).toUpperCase().slice(0, 48), space.points[0].x * overlay.width + 5, space.points[0].y * overlay.height - 6);
     }
+    if (draftPoints.length) {
+      ctx.beginPath(); ctx.moveTo(draftPoints[0].x * overlay.width, draftPoints[0].y * overlay.height);
+      for (const point of draftPoints.slice(1)) ctx.lineTo(point.x * overlay.width, point.y * overlay.height);
+      ctx.strokeStyle = '#48d6c5'; ctx.lineWidth = 2; ctx.setLineDash([6, 4]); ctx.stroke(); ctx.setLineDash([]);
+      for (const point of draftPoints) { ctx.beginPath(); ctx.arc(point.x * overlay.width, point.y * overlay.height, 4, 0, Math.PI * 2); ctx.fillStyle = '#48d6c5'; ctx.fill(); }
+    }
+    for (const object of latestObjects) {
+      const color = object.danger === 'high' ? '#f0796e' : object.danger === 'medium' ? '#eab05d' : '#48d6c5';
+      const x = object.x * overlay.width, y = object.y * overlay.height, w = object.w * overlay.width, h = object.h * overlay.height;
+      ctx.strokeStyle = color; ctx.lineWidth = Math.max(2, overlay.width / 640); ctx.strokeRect(x, y, w, h);
+      const label = `OBJECT ${String(object.id).padStart(3, '0')} · ${object.danger.toUpperCase()}`;
+      ctx.font = `${Math.max(11, overlay.width / 80)}px monospace`; const tw = ctx.measureText(label).width + 9;
+      ctx.fillStyle = color; ctx.fillRect(x, Math.max(0, y - 17), tw, 17); ctx.fillStyle = '#071411'; ctx.fillText(label, x + 4, Math.max(12, y - 5));
+    }
+  }
+
+  async function sendFrame() {
+    if (sendingFrame || !running || video.readyState < 2) return;
+    sendingFrame = true;
+    try {
+      // The browser only samples a compact grayscale frame. Tracking, baseline
+      // comparison, object association, zone checks, and danger scoring run on
+      // the authenticated local server over TLS.
+      pctx.drawImage(video, 0, 0, SAMPLE_W, SAMPLE_H);
+      const rgba = pctx.getImageData(0, 0, SAMPLE_W, SAMPLE_H).data, pixels = new Uint8Array((SAMPLE_W / CELL) * (SAMPLE_H / CELL));
+      let target = 0;
+      for (let y = 1; y < SAMPLE_H; y += CELL) for (let x = 1; x < SAMPLE_W; x += CELL) {
+        const i = (y * SAMPLE_W + x) * 4; pixels[target++] = Math.round((rgba[i] * 3 + rgba[i + 1] * 6 + rgba[i + 2]) / 10);
+      }
+      const binary = String.fromCharCode(...pixels);
+      const result = await api('/api/frame', { method: 'POST', body: JSON.stringify({ pixels: btoa(binary) }) });
+      latestObjects = result.objects; $('active-count').textContent = pad(latestObjects.length);
+      let zoneCountsChanged = false;
+      for (const counts of result.zoneEvents || []) {
+        const space = spaces.find(candidate => candidate.id === counts.id);
+        if (space && space.events !== counts.events) { space.events = counts.events; zoneCountsChanged = true; }
+      }
+      if (zoneCountsChanged) renderSpaces();
+      for (const event of result.events) addInsight(event);
+      if (result.calibration < 100) {
+        $('calibrate-button').textContent = `Calibrating ${result.calibration}%`;
+        $('signal-note').textContent = `Learning normal view · ${result.calibration}%`;
+        $('frame-info').textContent = 'CALIBRATING NORMAL VIEW';
+      } else if ($('calibrate-button').textContent !== 'Recalibrate view') {
+        $('calibrate-button').textContent = 'Recalibrate view'; $('signal-note').textContent = 'Normal view learned · server watching for changes'; $('frame-info').textContent = 'SERVER ANALYSIS ACTIVE';
+      }
+      drawOverlay();
+    } catch (error) {
+      console.error('Local analysis request failed', error);
+      $('signal-note').textContent = 'Local server analysis unavailable';
+      $('frame-info').textContent = 'SERVER CONNECTION ERROR';
+    } finally { sendingFrame = false; }
   }
 
   function analyzeLoop(now) {
     if (!running) return;
-    if (video.readyState >= 2 && now - lastAnalysis > 140) {
-      lastAnalysis = now;
-      try { updateTracks(detectMotion()); } catch (error) { console.warn('Frame analysis skipped', error); }
+    if (now - lastAnalysis > 180) {
+      lastAnalysis = now; sendFrame();
       if (video.duration && Number.isFinite(video.duration)) {
         $('timeline-progress').style.width = `${(video.currentTime / video.duration) * 100}%`;
         $('video-time').textContent = `${Math.floor(video.currentTime / 60)}:${pad(Math.floor(video.currentTime % 60))} / ${Math.floor(video.duration / 60)}:${pad(Math.floor(video.duration % 60))}`;
       } else $('video-time').textContent = clockText();
     }
     raf = requestAnimationFrame(analyzeLoop);
+  }
+
+  async function beginSource(kind, subtitle) {
+    running = true; latestObjects = []; $('play-toggle').textContent = 'Ⅱ';
+    setSignal(kind, subtitle); $('calibrate-button').textContent = 'Calibrating…';
+    try { await api('/api/calibrate', { method: 'POST', body: '{}' }); }
+    catch (error) { $('signal-note').textContent = `Local server unavailable: ${error.message}`; }
+    video.play().catch(() => {}); cancelAnimationFrame(raf); raf = requestAnimationFrame(analyzeLoop);
   }
 
   $('upload-trigger').addEventListener('click', () => $('file-input').click());
@@ -204,20 +168,18 @@
     if (sourceObjectUrl) URL.revokeObjectURL(sourceObjectUrl);
     if (cameraStream) { cameraStream.getTracks().forEach(track => track.stop()); cameraStream = null; }
     sourceObjectUrl = URL.createObjectURL(file); video.srcObject = null; video.src = sourceObjectUrl; video.load();
-    video.onloadedmetadata = () => beginSource(file.name, 'Recorded video · local analysis');
+    video.onloadedmetadata = () => beginSource(file.name, 'Recorded video · analysis on local server');
     video.onerror = () => { running = false; setSignal('Source error', 'This video could not be opened'); };
   });
   $('camera-trigger').addEventListener('click', async () => {
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      addInsight('warning', 'Camera unavailable', 'Camera access requires HTTPS or localhost in a supported browser.'); return;
-    }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { addInsight({ level: 'medium', title: 'Camera unavailable', detail: 'Camera access requires HTTPS in a supported browser.' }); return; }
     try {
       if (sourceObjectUrl) { URL.revokeObjectURL(sourceObjectUrl); sourceObjectUrl = null; }
       cameraStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
       video.removeAttribute('src'); video.srcObject = cameraStream;
-      video.onloadedmetadata = () => beginSource('Live camera', 'Camera feed · local analysis');
+      video.onloadedmetadata = () => beginSource('Live camera', 'Camera feed · analysis on local server');
     } catch (error) {
-      addInsight('warning', 'Camera connection failed', error.name === 'NotAllowedError' ? 'Camera permission was denied. Allow camera access and try again.' : 'No camera feed could be opened. Check that a camera is connected.');
+      addInsight({ level: 'medium', title: 'Camera connection failed', detail: error.name === 'NotAllowedError' ? 'Camera permission was denied. Allow access and try again.' : 'No camera feed could be opened.' });
     }
   });
   $('play-toggle').addEventListener('click', () => {
@@ -225,16 +187,58 @@
     if (video.paused) { video.play(); $('play-toggle').textContent = 'Ⅱ'; }
     else { video.pause(); $('play-toggle').textContent = '▶'; }
   });
-  $('fullscreen').addEventListener('click', () => {
-    if (stage.requestFullscreen) stage.requestFullscreen();
-  });
+  $('fullscreen').addEventListener('click', () => { if (stage.requestFullscreen) stage.requestFullscreen(); });
   $('clear-events').addEventListener('click', () => { events.length = 0; renderEvents(); });
-  $('zones-toggle').addEventListener('click', () => {
-    addInsight('info', 'Zone configuration', 'Prototype zones are fixed to the left entry area and right restricted area.');
+  $('calibrate-button').addEventListener('click', async () => {
+    if (!running) return;
+    $('calibrate-button').textContent = 'Calibrating…';
+    try { await api('/api/calibrate', { method: 'POST', body: '{}' }); }
+    catch (error) { addInsight({ level: 'medium', title: 'Calibration failed', detail: error.message }); }
+  });
+
+  function beginZoneDrawing() {
+    if (!running) { addInsight({ level: 'medium', title: 'Connect a camera first', detail: 'A video source is required before drawing restricted spaces.' }); return; }
+    drawingSpace = true; draftPoints = []; stage.classList.add('drawing'); $('draw-hint').classList.add('visible'); $('zones-toggle').textContent = 'Cancel drawing'; drawOverlay();
+  }
+  function cancelZoneDrawing() {
+    drawingSpace = false; draftPoints = []; stage.classList.remove('drawing'); $('draw-hint').classList.remove('visible'); $('zones-toggle').textContent = '＋ Add area'; drawOverlay();
+  }
+  async function finishZoneDrawing() {
+    if (!drawingSpace || draftPoints.length < 3) return;
+    const name = `Restricted space ${String(spaces.length + 1).padStart(2, '0')}`;
+    try {
+      const result = await api('/api/zones', { method: 'POST', body: JSON.stringify({ name, points: draftPoints }) });
+      spaces.splice(0, spaces.length, ...result.zones); cancelZoneDrawing(); renderSpaces();
+    } catch (error) { addInsight({ level: 'medium', title: 'Could not save restricted space', detail: error.message }); }
+  }
+  $('zones-toggle').addEventListener('click', () => drawingSpace ? cancelZoneDrawing() : beginZoneDrawing());
+  overlay.addEventListener('click', event => {
+    if (!drawingSpace || !video.videoWidth) return;
+    const rect = stage.getBoundingClientRect(), scale = Math.min(rect.width / video.videoWidth, rect.height / video.videoHeight);
+    const offsetX = (rect.width - video.videoWidth * scale) / 2, offsetY = (rect.height - video.videoHeight * scale) / 2;
+    const x = (event.clientX - rect.left - offsetX) / scale / video.videoWidth, y = (event.clientY - rect.top - offsetY) / scale / video.videoHeight;
+    if (x >= 0 && x <= 1 && y >= 0 && y <= 1) { draftPoints.push({ x, y }); drawOverlay(); }
+  });
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape' && drawingSpace) cancelZoneDrawing();
+    if (event.key === 'Enter' && drawingSpace) finishZoneDrawing();
+  });
+  $('logout-button').addEventListener('click', async () => {
+    try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch (_) {}
+    window.location.assign('/login');
   });
   video.addEventListener('ended', () => { $('play-toggle').textContent = '▶'; });
   video.addEventListener('play', () => { if (running) $('play-toggle').textContent = 'Ⅱ'; });
-  window.addEventListener('resize', drawTracks);
-  setSignal('Waiting for signal', 'Connect a video source');
-  renderEvents();
+  window.addEventListener('resize', drawOverlay);
+
+  async function boot() {
+    try {
+      const session = await api('/api/session'); csrf = session.csrf;
+      const data = await api('/api/zones'); spaces.splice(0, spaces.length, ...data.zones);
+      renderSpaces(); renderEvents(); setSignal('Waiting for signal', 'Connect a source · processing remains on this server');
+    } catch (error) {
+      $('signal-note').textContent = 'Unable to initialize secure local session'; console.error(error);
+    }
+  }
+  boot();
 })();
