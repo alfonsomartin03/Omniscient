@@ -1,0 +1,5 @@
+# Private credentials, the local certificate authority, and server state
+data/
+.venv/
+__pycache__/
+*.py[cod]
