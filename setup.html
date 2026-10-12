@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0b1119" />
+    <title>Omniscient — Set up a space</title>
+    <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="spatial.css" />
+    <link rel="stylesheet" href="setup.css" />
+  </head>
+  <body class="su-body">
+    <header class="su-top">
+      <a class="brand" href="/" aria-label="Back to the console"><span class="brand-mark">◉</span><span>omni<span class="brand-light">scient</span></span></a>
+      <span class="su-top-title">Set up a space</span>
+      <nav class="su-top-links"><a href="#" id="su-home-link">Your spaces</a><a href="/">Back to console</a></nav>
+    </header>
+    <div id="su-error" class="su-error" role="alert" hidden></div>
+    <main class="su-main">
+      <section id="su-home" aria-label="Your spaces"></section>
+      <section id="su-wizard" hidden aria-label="Setup steps">
+        <div class="su-wizard-head"><h1 id="su-title">Space</h1><span id="su-saved" class="su-saved" aria-live="polite"></span></div>
+        <ol class="su-steps" id="su-steps"></ol>
+        <div id="su-step-body"></div>
+        <div class="su-nav"><button class="button-secondary" id="su-back">Back</button><span id="su-nav-note" class="su-muted"></span><button class="button-primary" id="su-next">Next</button></div>
+      </section>
+      <section class="spatial" id="spatial" data-manual hidden aria-label="Live view">
+        <h2 class="su-h2">Live view</h2>
+        <div class="spatial-banner" id="spatial-banner"></div>
+        <div class="spatial-grid">
+          <article class="panel"><div class="panel-header"><div><div class="panel-title">MAP <span class="feed-separator">/</span> TOP-DOWN</div><div class="panel-subtitle" id="spatial-map-sub">Loading map…</div></div></div><canvas id="spatial-map" aria-label="Top-down map with radar tracks"></canvas></article>
+          <article class="panel"><div class="panel-header"><div><div class="panel-title">CAMERA VIEW <span class="feed-separator">/</span> RADAR MARKERS</div><div class="panel-subtitle">Approximate · dashed = predicted, 2D or unquantified calibration error</div></div></div><canvas id="spatial-cam" aria-label="Camera view with approximate radar markers"></canvas></article>
+        </div>
+        <div class="spatial-grid">
+          <article class="panel"><div class="panel-header"><div><div class="panel-title">SENSOR UNITS &amp; CALIBRATION</div><div class="panel-subtitle">Health, staleness and transform status</div></div></div><div id="spatial-units"></div></article>
+          <article class="panel"><div class="panel-header"><div><div class="panel-title">RADAR TRACKS <span class="count-pill" id="spatial-track-count">0</span></div><div class="panel-subtitle">Anonymous IDs · map frame · metres</div></div></div><div id="spatial-tracks"></div></article>
+        </div>
+        <p class="spatial-note">Markers show the radar's reference point for a target, transformed through the saved calibration. They can sit beside a person, and targets without elevation have an assumed height. Not a precise measurement and not safety-rated.</p>
+      </section>
+    </main>
+    <script src="spatial.js"></script>
+    <script src="setup.js"></script>
+  </body>
+</html>

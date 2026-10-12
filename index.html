@@ -6,6 +6,7 @@
     <meta name="theme-color" content="#0b1119" />
     <title>Omniscient — Visual Security</title>
     <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="spatial.css" />
   </head>
   <body>
     <div class="app-shell">
@@ -17,6 +18,8 @@
           <a class="nav-item active" href="#overview"><span>◫</span> Overview <kbd>⌘1</kbd></a>
           <a class="nav-item" href="#events"><span>◷</span> Event history <b class="nav-count" id="nav-event-count">0</b></a>
           <a class="nav-item" href="#zones"><span>⌗</span> Restricted spaces</a>
+          <a class="nav-item spatial-nav" href="#spatial" hidden><span>⌖</span> Spatial tracking</a>
+          <a class="nav-item" href="/setup"><span>⚙</span> Set up a space</a>
         </nav>
         <p class="nav-label sources-label">SOURCES <button id="add-source" aria-label="Add video source">＋</button></p>
         <div class="source-item"><span class="source-icon">▧</span><span><strong>Primary feed</strong><small id="source-status">Waiting for signal</small></span><i id="source-dot"></i></div>
@@ -52,9 +55,22 @@
 
         <section class="lower-grid"><article class="panel activity-panel"><div class="panel-header"><div><div class="panel-title">ACTIVITY OVERVIEW</div><div class="panel-subtitle">Detected events by hour · this session</div></div><span class="period-chip">SESSION</span></div><div class="chart-wrap"><div class="chart-y"><span>MAX</span><span>MID</span><span>0</span></div><div class="chart-area"><div class="chart-guides"><i></i><i></i><i></i></div><svg viewBox="0 0 720 118" preserveAspectRatio="none" aria-label="Hourly security events this session"><defs><linearGradient id="chartFill" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#43d6c2" stop-opacity=".22"/><stop offset="1" stop-color="#43d6c2" stop-opacity="0"/></linearGradient></defs><path class="chart-fill" id="chart-fill" d="M0,105 L720,105 V118 H0Z"/><path class="chart-line" id="chart-line" d="M0,105 L720,105"/></svg><div class="chart-x"><span>00:00</span><span>04:00</span><span>08:00</span><span>12:00</span><span>16:00</span><span>20:00</span><span>NOW</span></div></div></div></article>
           <article class="panel zones-panel" id="zones"><div class="panel-header"><div><div class="panel-title">RESTRICTED SPACES <span class="count-pill" id="zone-count">0</span></div><div class="panel-subtitle">Draw custom areas on the camera view</div></div><button class="text-button" id="zones-toggle">＋ Add area</button></div><div class="zones-list" id="zones-list"><div class="zones-empty">No restricted spaces configured. Add one to alert on objects entering it.</div></div><div class="zone-foot"><span class="green-pulse"></span> Alerts are generated for medium and high danger only</div></article></section>
+        <section class="spatial" id="spatial" hidden aria-label="Spatial tracking">
+          <div class="spatial-banner" id="spatial-banner"></div>
+          <div class="spatial-grid">
+            <article class="panel"><div class="panel-header"><div><div class="panel-title">SPATIAL MAP <span class="feed-separator">/</span> TOP-DOWN</div><div class="panel-subtitle" id="spatial-map-sub">Loading map…</div></div></div><canvas id="spatial-map" aria-label="Top-down map with radar tracks"></canvas></article>
+            <article class="panel"><div class="panel-header"><div><div class="panel-title">CAMERA VIEW <span class="feed-separator">/</span> RADAR MARKERS</div><div class="panel-subtitle">Approximate projection · dashed = predicted, 2D or unquantified calibration error</div></div></div><canvas id="spatial-cam" aria-label="Camera view with approximate radar markers"></canvas></article>
+          </div>
+          <div class="spatial-grid">
+            <article class="panel"><div class="panel-header"><div><div class="panel-title">SENSOR UNITS &amp; CALIBRATION</div><div class="panel-subtitle">Health, staleness and transform status</div></div></div><div id="spatial-units"></div></article>
+            <article class="panel"><div class="panel-header"><div><div class="panel-title">RADAR TRACKS <span class="count-pill" id="spatial-track-count">0</span></div><div class="panel-subtitle">Anonymous IDs · map frame · metres</div></div></div><div id="spatial-tracks"></div></article>
+          </div>
+          <p class="spatial-note">Positions come from radar returns transformed through stored calibrations. A marker is the radar's reference point for a target, not the outline of a person; it can be offset from a body, and targets without elevation have an assumed, uncertain height. Not a precise measurement and not safety-rated.</p>
+        </section>
         <footer class="page-footer"><span>OMNISCIENT <b>VISUAL SECURITY PLATFORM</b></span><span>LOCAL OBJECT DETECTION · COCO LABELS</span><span>ALL INFERENCE LOCAL <i>◇</i></span></footer>
       </main>
     </div>
     <script src="app.js"></script>
+    <script src="spatial.js"></script>
   </body>
 </html>

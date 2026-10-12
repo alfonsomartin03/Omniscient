@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "unit_id": "unit-01",
+  "label": "Wall unit (simulated)",
+  "enclosure_in_map": {
+    "translation_m": [
+      6.0,
+      0.25,
+      2.4
+    ],
+    "rotation": {
+      "rpy_deg": {
+        "yaw": 0,
+        "pitch": -12,
+        "roll": 0
+      }
+    },
+    "calibration": {
+      "status": "simulated",
+      "revision": 1,
+      "calibrated_at": "2026-01-01T00:00:00Z",
+      "method": "synthetic ground truth (demo only)",
+      "position_sigma_m": 0.0,
+      "rotation_sigma_deg": 0.0,
+      "notes": "enclosure -> map: values are invented for the simulator."
+    }
+  },
+  "radar": {
+    "sensor_id": "radar-01",
+    "adapter": "jsonl_replay",
+    "source": {
+      "path": "radar_sample.jsonl",
+      "loop": true
+    },
+    "in_enclosure": {
+      "translation_m": [
+        0,
+        0,
+        0
+      ],
+      "rotation": {
+        "rpy_deg": {
+          "yaw": 0,
+          "pitch": 0,
+          "roll": 0
+        }
+      },
+      "calibration": {
+        "status": "simulated",
+        "revision": 1,
+        "calibrated_at": "2026-01-01T00:00:00Z",
+        "method": "synthetic ground truth (demo only)",
+        "position_sigma_m": 0.0,
+        "rotation_sigma_deg": 0.0,
+        "notes": "radar -> enclosure: values are invented for the simulator."
+      }
+    },
+    "max_range_m": 15,
+    "azimuth_fov_deg": [
+      -60,
+      60
+    ],
+    "elevation_fov_deg": [
+      -30,
+      30
+    ],
+    "nominal_sigma": {
+      "range_m": 0.06,
+      "azimuth_deg": 1.0,
+      "elevation_deg": 3.0
+    },
+    "unknown_elevation_sigma_deg": 20,
+    "stale_after_s": 1.5,
+    "missing_after_s": 5
+  },
+  "camera": {
+    "sensor_id": "cam-01",
+    "stream": "none",
+    "in_enclosure": {
+      "translation_m": [
+        0.03,
+        0.02,
+        0.05
+      ],
+      "rotation": {
+        "rpy_deg": {
+          "yaw": 1.5,
+          "pitch": 0.8,
+          "roll": 0
+        }
+      },
+      "calibration": {
+        "status": "simulated",
+        "revision": 1,
+        "calibrated_at": "2026-01-01T00:00:00Z",
+        "method": "synthetic ground truth (demo only)",
+        "position_sigma_m": 0.0,
+        "rotation_sigma_deg": 0.0,
+        "notes": "camera -> enclosure: values are invented for the simulator."
+      }
+    },
+    "intrinsics": {
+      "model": "pinhole_brown_conrady",
+      "width": 1280,
+      "height": 720,
+      "fx": 900,
+      "fy": 900,
+      "cx": 640,
+      "cy": 360,
+      "distortion": [
+        -0.05,
+        0.01,
+        0,
+        0
+      ],
+      "calibration": {
+        "status": "simulated",
+        "revision": 1,
+        "calibrated_at": "2026-01-01T00:00:00Z",
+        "method": "synthetic ground truth (demo only)",
+        "position_sigma_m": 0.0,
+        "rotation_sigma_deg": 0.0,
+        "notes": "lens intrinsics: values are invented for the simulator."
+      }
+    }
+  }
+}

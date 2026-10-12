@@ -37,6 +37,20 @@ OMNI_BIND=192.168.1.20 python server.py
 
 For a local DNS name, set `OMNI_ALLOWED_HOSTS` before first run, for example `OMNI_ALLOWED_HOSTS=omniscient.local OMNI_BIND=192.168.1.20 python server.py`; the name is included in the generated certificate. Install and trust the local CA on each allowed client, use a matching name or IP in the URL, and restrict port 8443 at the host firewall to trusted devices. Do not forward this port to the internet or put it behind a public reverse proxy.
 
+## Spatial tracking (optional, milestone 1)
+
+An opt-in module places anonymous radar tracks on a LiDAR/point-cloud map and projects them into a camera view, using stored, versioned calibrations. Milestone 1 runs only on **simulated or recorded sample data**; no real radar or camera adapter exists yet. It is off unless you set `OMNI_SPATIAL_SITE`:
+
+```sh
+OMNI_SPATIAL_SITE=samples/spatial/demo python server.py   # then open "Spatial tracking" in the sidebar
+python3 -m unittest discover -s tests -v                   # stdlib-only tests
+python3 -m spatial.simulate samples/spatial/demo           # regenerate the sample
+```
+
+**No command line needed for normal setup:** open **Set up a space** in the sidebar (`/setup`) to upload a map, connect sensors, place the unit, calibrate with a few reference spots, and go live. It saves a resumable draft after every action and shows calibration quality and uncertainty rather than a bare "calibrated". Until a real radar adapter exists, guided calibration works only with the built-in simulated demo sensors (use the sample room to try it). See [docs/spatial-architecture.md §8](docs/spatial-architecture.md).
+
+The camera-only workflow is unchanged. The UI labels simulated data, shows radar health (ok/stale/missing), per-transform calibration status and declared accuracy, and marks overlays as approximate. See [docs/spatial-architecture.md](docs/spatial-architecture.md) (assessment, calibration procedure, staged plan, open hardware questions) and [docs/spatial-data-formats.md](docs/spatial-data-formats.md).
+
 ## Local data and security boundaries
 
 - Browser-to-server traffic uses TLS 1.2 or later. There is no plaintext HTTP listener or cloud inference fallback.

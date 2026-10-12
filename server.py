@@ -25,13 +25,20 @@ import urllib.parse
 from pathlib import Path
 
 from vision import MODEL_WORKER, ModelBusy, ModelFailure, bbox_iou
+from spatial.geometry import ConfigError as SpatialConfigError
+from spatial.runtime import SpatialRuntime
+from spatial.setup import SetupError, SetupStore, MAX_MAP_BYTES
+from spatial import setup_api
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 TLS_DIR = DATA / "tls"
 AUTH_FILE = DATA / "auth.json"
 ZONES_FILE = DATA / "restricted_spaces.json"
-STATIC = {"/": "index.html", "/index.html": "index.html", "/styles.css": "styles.css", "/app.js": "app.js"}
+STATIC = {"/": "index.html", "/index.html": "index.html", "/styles.css": "styles.css", "/app.js": "app.js",
+          "/spatial.css": "spatial.css", "/spatial.js": "spatial.js",
+          "/setup": "setup.html", "/setup.css": "setup.css", "/setup.js": "setup.js"}
+SAMPLE_MAP = ROOT / "samples" / "spatial" / "demo" / "map.ply"
 FRAME_W, FRAME_H = 40, 22
 FRAME_SIZE = FRAME_W * FRAME_H
 MAX_FRAME_W, MAX_FRAME_H = 960, 540
@@ -46,6 +53,12 @@ ANALYSIS: dict[str, dict] = {}
 ZONES: list[dict] = []
 ALLOWED_HOSTS: set[str] = {"localhost", "127.0.0.1", "::1"}
 STATE_LOCK = threading.RLock()
+# Optional LiDAR-map + camera-radar tracking. Off unless OMNI_SPATIAL_SITE names a site directory; the
+# camera-only workflow does not depend on it. State is shared by all authenticated sessions.
+SPATIAL: SpatialRuntime | None = None
+SPATIAL_ERROR = ""
+SETUP: SetupStore | None = None
+SPATIAL_UNIT_PATH = re.compile(r"^/api/spatial/camera/([A-Za-z0-9][A-Za-z0-9_-]{0,31})$")
 
 
 def read_json(path: Path, fallback):
@@ -427,7 +440,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not token:
                 self.send_response(303); self.security_headers(); self.send_header("Location", "/login"); self.send_header("Cache-Control", "no-store"); self.end_headers(); return
             file_path = ROOT / STATIC[path]
-            content_type = "text/html; charset=utf-8" if path.endswith("html") or path == "/" else "text/css; charset=utf-8" if path.endswith("css") else "text/javascript; charset=utf-8"
+            suffix = file_path.suffix
+            content_type = "text/html; charset=utf-8" if suffix == ".html" else "text/css; charset=utf-8" if suffix == ".css" else "text/javascript; charset=utf-8"
             self.respond(200, file_path.read_bytes(), content_type, {"X-Omni-CSRF": session["csrf"]})
             return
         if path == "/api/session":
@@ -439,7 +453,89 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if self.authorized():
                 with STATE_LOCK: self.json(200, {"zones": ZONES})
             return
+        if path.startswith("/api/spatial/"):
+            self.spatial_get(path)
+            return
+        if path.startswith("/api/setup/"):
+            if self.authorized():
+                self.setup_request("GET", path)
+            return
         self.respond(404, b"Not found", "text/plain; charset=utf-8")
+
+    def setup_request(self, method: str, path: str):
+        """Setup wizard API. Callers have already authenticated (and checked CSRF for mutations)."""
+        payload = {}
+        if method in ("POST", "DELETE"):
+            try:
+                payload = json.loads(self.body() or b"{}")
+            except (ValueError, json.JSONDecodeError):
+                self.json(400, {"error": "Invalid request"}); return
+            if not isinstance(payload, dict):
+                self.json(400, {"error": "Invalid request"}); return
+        activate = re.fullmatch(r"/api/setup/sites/([A-Za-z0-9][A-Za-z0-9_-]{0,31})/activate", path)
+        if activate and method == "POST":
+            self.activate_site(activate.group(1)); return
+        if method == "PUT":
+            self.upload_map(path); return
+        status, body = setup_api.handle(SETUP, method, path, payload, SAMPLE_MAP if SAMPLE_MAP.is_file() else None)
+        self.json(status, body)
+
+    def activate_site(self, site_id: str):
+        global SPATIAL, SPATIAL_ERROR
+        try:
+            directory = SETUP.saved_directory(site_id)
+            runtime = SpatialRuntime.from_directory(directory)
+        except SetupError as exc:
+            self.json(exc.status, {"error": exc.message, "hint": exc.hint}); return
+        except SpatialConfigError as exc:
+            self.json(422, {"error": f"This setup can't be started: {exc}", "hint": "Go back and re-save the setup."}); return
+        SPATIAL, SPATIAL_ERROR = runtime, ""
+        write_json_private(DATA / "spatial" / "active.json", {"site_id": site_id})
+        self.json(200, {"ok": True, "site_id": site_id})
+
+    def upload_map(self, path: str):
+        match = re.fullmatch(r"/api/setup/sites/([A-Za-z0-9][A-Za-z0-9_-]{0,31})/map", path)
+        if not match:
+            self.respond(404, b"Not found", "text/plain; charset=utf-8"); return
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.json(400, {"error": "Invalid content length"}); return
+        if length > MAX_MAP_BYTES:
+            # Refuse before reading the body, and close so the unread bytes cannot be taken as a new request.
+            self.close_connection = True
+            self.json(413, {"error": f"That file is {length / 1e6:.0f} MB; the limit is {MAX_MAP_BYTES / 1e6:.0f} MB.",
+                            "hint": "Reduce the number of points (a decimated export is plenty) and try again."}); return
+        try:
+            body = SETUP.receive_map(match.group(1), self.rfile.read, length, query.get("name", [""])[0],
+                                     query.get("units", ["m"])[0], query.get("up", ["z"])[0])
+        except SetupError as exc:
+            self.close_connection = True
+            self.json(exc.status, {"error": exc.message, "hint": exc.hint}); return
+        self.json(200, body)
+
+    def spatial_get(self, path: str):
+        if not self.authorized():
+            return
+        if path == "/api/spatial/status":
+            self.json(200, {"enabled": SPATIAL is not None, "error": SPATIAL_ERROR or None,
+                            "site_id": SPATIAL.site.site_id if SPATIAL else None})
+            return
+        if SPATIAL is None:
+            self.json(404, {"error": "Spatial tracking is not enabled"})
+            return
+        if path == "/api/spatial/state":
+            self.json(200, SPATIAL.snapshot())
+        elif path == "/api/spatial/map":
+            self.json(200, SPATIAL.map_payload())
+        else:
+            match = SPATIAL_UNIT_PATH.match(path)
+            view = SPATIAL.camera_view(match.group(1)) if match else None
+            if view is None:
+                self.json(404, {"error": "Unknown sensor unit"})
+            else:
+                self.json(200, view)
 
     def do_POST(self):
         if not self.valid_host():
@@ -452,6 +548,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not authorized:
             return
         token, _ = authorized
+        if path.startswith("/api/setup/"):
+            self.setup_request("POST", path); return
         if path == "/api/frame":
             if self.headers.get("Content-Type", "").split(";", 1)[0].lower() != "image/jpeg":
                 self.json(415, {"error": "Expected a JPEG camera frame"}); return
@@ -502,6 +600,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.respond(400, b"Invalid host", "text/plain; charset=utf-8"); return
         if not self.authorized(csrf=True): return
         path = urllib.parse.urlsplit(self.path).path
+        if path.startswith("/api/setup/"):
+            self.setup_request("DELETE", path); return
         if path.startswith("/api/zones/"):
             try: zone_id = int(path.rsplit("/", 1)[1])
             except ValueError: self.json(400, {"error": "Invalid zone"}); return
@@ -509,6 +609,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 ZONES[:] = [zone for zone in ZONES if zone["id"] != zone_id]
                 write_json_private(ZONES_FILE, ZONES)
                 self.json(200, {"zones": ZONES}); return
+        self.respond(404, b"Not found", "text/plain; charset=utf-8")
+
+    def do_PUT(self):
+        if not self.valid_host():
+            self.respond(400, b"Invalid host", "text/plain; charset=utf-8"); return
+        if not self.authorized(csrf=True): return
+        path = urllib.parse.urlsplit(self.path).path
+        if path.startswith("/api/setup/"):
+            self.setup_request("PUT", path); return
         self.respond(404, b"Not found", "text/plain; charset=utf-8")
 
     def login(self):
@@ -623,8 +732,26 @@ class BoundedHTTPServer(http.server.ThreadingHTTPServer):
 
 
 def main():
-    global ZONES, ALLOWED_HOSTS
+    global ZONES, ALLOWED_HOSTS, SPATIAL, SPATIAL_ERROR, SETUP
     ensure_password()
+    SETUP = SetupStore(DATA / "spatial")
+    site_dir = os.environ.get("OMNI_SPATIAL_SITE", "").strip()
+    if site_dir:
+        try:
+            SPATIAL = SpatialRuntime.from_directory(Path(site_dir) if Path(site_dir).is_absolute() else ROOT / site_dir)
+            print(f"Spatial tracking enabled ({SPATIAL.site.data_origin} data, site '{SPATIAL.site.site_id}').")
+        except SpatialConfigError as exc:
+            SPATIAL_ERROR = f"Spatial tracking disabled: {exc}"
+            print(SPATIAL_ERROR + " The camera-only workflow is unaffected.")
+    else:
+        active = read_json(DATA / "spatial" / "active.json", {})
+        if isinstance(active, dict) and isinstance(active.get("site_id"), str):
+            try:
+                SPATIAL = SpatialRuntime.from_directory(SETUP.saved_directory(active["site_id"]))
+                print(f"Spatial tracking resumed from saved setup '{active['site_id']}'.")
+            except (SetupError, SpatialConfigError) as exc:
+                SPATIAL_ERROR = f"Saved setup could not be started: {getattr(exc, 'message', exc)}"
+                print(SPATIAL_ERROR)
     loaded_zones = read_json(ZONES_FILE, [])
     if ZONES_FILE.exists():
         os.chmod(ZONES_FILE, 0o600)
